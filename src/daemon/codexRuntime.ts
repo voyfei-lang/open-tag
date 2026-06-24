@@ -149,7 +149,7 @@ export const codexRuntime: Runtime = {
 
     (async () => {
       try {
-        await client.request("initialize", { clientInfo: { name: "fancy-loop", title: "fancy-loop", version: "0.1.0" }, capabilities: { experimentalApi: true } });
+        await client.request("initialize", { clientInfo: { name: "open-tag", title: "open-tag", version: "0.1.0" }, capabilities: { experimentalApi: true } });
         client.notify("initialized");
         let threadId = "";
         const cfg = codexConfig(opts);

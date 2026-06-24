@@ -1,15 +1,15 @@
-// Unified structured logging: JSON lines written to ~/.fancy-loop/logs/<component>.log plus human-readable console output.
-// To tail logs: tail -f ~/.fancy-loop/logs/server.log  (or daemon/cli/agent-<id>)
+// Unified structured logging: JSON lines written to ~/.open-tag/logs/<component>.log plus human-readable console output.
+// To tail logs: tail -f ~/.open-tag/logs/server.log  (or daemon/cli/agent-<id>)
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const LOG_DIR = process.env.FANCY_LOG_DIR ?? path.join(os.homedir(), ".fancy-loop", "logs");
+const LOG_DIR = process.env.OPEN_TAG_LOG_DIR ?? path.join(os.homedir(), ".open-tag", "logs");
 try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch { /* */ }
 
 type Level = "debug" | "info" | "warn" | "error";
 const order: Record<Level, number> = { debug: 10, info: 20, warn: 30, error: 40 };
-const MIN = order[(process.env.FANCY_LOG_LEVEL as Level) ?? "debug"] ?? 10;
+const MIN = order[(process.env.OPEN_TAG_LOG_LEVEL as Level) ?? "debug"] ?? 10;
 
 export interface Logger {
   debug(msg: string, fields?: Record<string, unknown>): void;

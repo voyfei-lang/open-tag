@@ -1,11 +1,11 @@
-// Reads agent workspace (~/.fancy-loop/agents/<id>/) and exposes file tree / file content via WS-RPC to the server.
+// Reads agent workspace (~/.open-tag/agents/<id>/) and exposes file tree / file content via WS-RPC to the server.
 // File tree: returns a flat list of the entire tree {files:[{name,path,isDirectory,size,modifiedAt}]};
 //            read file: returns {path, content}. Security: path must remain inside the workspace root (prevents ../ escape).
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
-const DATA_DIR = path.join(os.homedir(), ".fancy-loop", "agents");
+const DATA_DIR = path.join(os.homedir(), ".open-tag", "agents");
 const MAX_FILE = 256 * 1024;
 const SKIP = new Set(["node_modules", ".git"]);
 

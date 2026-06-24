@@ -47,7 +47,7 @@ export async function channelMembers(channelId: string): Promise<Member[]> {
 
 export function parseMentions(content: string, members: Member[]) {
   const found = new Map<string, Member>();
-  const re = /@([A-Za-z0-9_一-龥-]+)/g;
+  const re = /@([A-Za-z0-9_\u4e00-\u9fa5-]+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(content))) {
     const name = m[1]!;

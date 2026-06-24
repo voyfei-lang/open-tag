@@ -5,8 +5,8 @@ import { useTranslation } from "react-i18next";
 
 // On successful login/register: persist token, clear dev user, and redirect to target (defaults to root → RootRedirect to own workspace).
 function finishAuth(token: string, to = "/") {
-  localStorage.setItem("fancy.token", token);
-  localStorage.removeItem("fancy.devuser"); // clear dev user so dev-login doesn't override the real account
+  localStorage.setItem("open-tag.token", token);
+  localStorage.removeItem("open-tag.devuser"); // clear dev user so dev-login doesn't override the real account
   window.location.assign(to);
 }
 
@@ -51,7 +51,7 @@ export function JoinPage() {
   const [mode, setMode] = useState<"login" | "register">("register");
   const [name, setName] = useState(""); const [email, setEmail] = useState(""); const [password, setPassword] = useState("");
   const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
-  const loggedIn = !!localStorage.getItem("fancy.token");
+  const loggedIn = !!localStorage.getItem("open-tag.token");
   useEffect(() => { (async () => { try { setInfo(await (await fetch(`/api/auth/invite-info?token=${encodeURIComponent(token || "")}`)).json()); } catch { setInfo({ valid: false }); } })(); }, [token]);
   const accept = async (authToken: string) => {
     const r = await fetch("/api/auth/accept-invite", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + authToken }, body: JSON.stringify({ token }) });
@@ -59,7 +59,7 @@ export function JoinPage() {
     if (!r.ok) throw new Error(d.error || t("auth.joinFailed"));
     finishAuth(authToken, `/s/${d.serverSlug}/channel`);
   };
-  const joinAsCurrent = async () => { if (busy) return; setBusy(true); setErr(""); try { await accept(localStorage.getItem("fancy.token")!); } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); } };
+  const joinAsCurrent = async () => { if (busy) return; setBusy(true); setErr(""); try { await accept(localStorage.getItem("open-tag.token")!); } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); } };
   const submitAuth = async () => {
     if (busy) return;
     setBusy(true); setErr("");

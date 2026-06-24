@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// fancy-loop local daemon: connects to the control-plane WS and spawns locally-installed CLI agents (claude/codex) on demand.
-// Usage: fancy-loop-daemon --server-url http://localhost:7777 --api-key <machineKey>
+// open-tag local daemon: connects to the control-plane WS and spawns locally-installed CLI agents (claude/codex) on demand.
+// Usage: open-tag-daemon --server-url http://localhost:7777 --api-key <machineKey>
 import "../env.js"; // must be first: loads project root .env (does not override shell env vars like OPENAI_API_KEY)
 import os from "node:os";
 import fs from "node:fs";
@@ -21,14 +21,14 @@ for (let i = 0; i < args.length; i++) {
 // Default: connect to the server port from .env (worktree/prod each have their own .env port; --server-url overrides).
 if (!serverUrl) serverUrl = `http://localhost:${process.env.PORT ?? 7777}`;
 if (!apiKey) {
-  console.error("Usage: fancy-loop-daemon [--server-url <url>] --api-key <machineKey>");
+  console.error("Usage: open-tag-daemon [--server-url <url>] --api-key <machineKey>");
   process.exit(1);
 }
 
-// Stable machine identity: on first connection the server assigns machine.id via ready:ack, persisted to ~/.fancy-loop/machine-id.
+// Stable machine identity: on first connection the server assigns machine.id via ready:ack, persisted to ~/.open-tag/machine-id.
 // Subsequent connections include it so the server can recognize the same machine across restarts,
 // avoiding orphan machine rows from unstable hostnames.
-const MID_FILE = path.join(os.homedir(), ".fancy-loop", "machine-id");
+const MID_FILE = path.join(os.homedir(), ".open-tag", "machine-id");
 const readMachineId = (): string | undefined => { try { return fs.readFileSync(MID_FILE, "utf8").trim() || undefined; } catch { return undefined; } };
 const saveMachineId = (id: string): void => { try { fs.mkdirSync(path.dirname(MID_FILE), { recursive: true }); fs.writeFileSync(MID_FILE, id); } catch { /* */ } };
 
@@ -59,7 +59,7 @@ conn = new Connection(serverUrl, apiKey, (msg) => {
   });
 });
 
-log.info("fancy-loop daemon starting", { serverUrl });
+log.info("open-tag daemon starting", { serverUrl });
 conn.connect();
 const shutdown = () => { log.info("shutting down"); mgr.stopAll(); conn.close(); process.exit(0); };
 process.on("SIGINT", shutdown);

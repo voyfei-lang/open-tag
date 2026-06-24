@@ -13,7 +13,7 @@
     "language": "Language",
     "languageDesc": "Choose the interface language. Takes effect immediately.",
     "langEnglish": "English",
-    "langChinese": "中文"
+    "langChinese": "Chinese"
   },
   "tasks": {
     "statusTodo": "To Do",
@@ -99,7 +99,7 @@
     "remCancelled": "Cancelled",
     "remindersTitle": "Scheduled Reminders",
     "remindersCount": "{{scheduled}} pending / {{total}} total",
-    "remindersEmpty": "@{{name}} has no reminders scheduled. The agent creates them via `fancy reminder schedule` and will be @-mentioned when they fire (read-only here).",
+    "remindersEmpty": "@{{name}} has no reminders scheduled. The agent creates them via `open-tag reminder schedule` and will be @-mentioned when they fire (read-only here).",
     "recurrenceEvery": "every {{seconds}}s",
     "activityEmpty": "@{{name}} — put it to work and real-time thinking / tool calls / status changes will appear here (timeline).",
     "hideDotFiles": "Hide dot files",

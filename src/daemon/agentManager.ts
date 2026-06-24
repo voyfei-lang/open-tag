@@ -3,14 +3,14 @@ import { mkdir, writeFile, access, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { buildSystemPrompt, STARTUP_NUDGE, RESUME_NUDGE, inboxNotice } from "./prompt.js";
-import { ensureFancyBin } from "./fancyBin.js";
+import { ensureOpenTagBin } from "./openTagBin.js";
 import { getRuntime } from "./runtimes.js";
 import type { RuntimeSession, RuntimeCallbacks } from "./runtime.js";
 import { createLogger } from "../log.js";
 
-const DATA_DIR = path.join(os.homedir(), ".fancy-loop", "agents");
-const IDLE_MS = Number(process.env.FANCY_IDLE_MS ?? 10 * 60 * 1000); // how long before idle sleep (kills process to save memory; next wake uses --resume)
-const DELIVER_DEBOUNCE_MS = Number(process.env.FANCY_DELIVER_DEBOUNCE_MS ?? 3000); // batching window for deliveries while agent is busy (saves tokens, reduces interruptions)
+const DATA_DIR = path.join(os.homedir(), ".open-tag", "agents");
+const IDLE_MS = Number(process.env.OPEN_TAG_IDLE_MS ?? 10 * 60 * 1000); // how long before idle sleep (kills process to save memory; next wake uses --resume)
+const DELIVER_DEBOUNCE_MS = Number(process.env.OPEN_TAG_DELIVER_DEBOUNCE_MS ?? 3000); // batching window for deliveries while agent is busy (saves tokens, reduces interruptions)
 
 export interface AgentConfig {
   name: string; displayName: string; description?: string | null;
@@ -25,7 +25,7 @@ export class AgentManager {
   private agents = new Map<string, Running>();
   private binDir: string;
   private log = createLogger("daemon:agents");
-  constructor(private send: (msg: unknown) => void) { this.binDir = ensureFancyBin(); }
+  constructor(private send: (msg: unknown) => void) { this.binDir = ensureOpenTagBin(); }
 
   running(): string[] { return [...this.agents.keys()]; }
   stopAll(): void { for (const id of [...this.agents.keys()]) this.stop(id); }
@@ -81,7 +81,7 @@ export class AgentManager {
     const env: NodeJS.ProcessEnv = {
       ...process.env, FORCE_COLOR: "0",
       PATH: `${this.binDir}:${process.env.PATH ?? ""}`,
-      FANCY_SERVER_URL: config.serverUrl, FANCY_AGENT_ID: agentId, FANCY_AGENT_TOKEN: config.agentToken ?? "",
+      OPEN_TAG_SERVER_URL: config.serverUrl, OPEN_TAG_AGENT_ID: agentId, OPEN_TAG_AGENT_TOKEN: config.agentToken ?? "",
     };
     delete env.CLAUDECODE; delete env.CLAUDE_CODE_ENTRYPOINT;
 

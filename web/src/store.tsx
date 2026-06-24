@@ -85,7 +85,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const createChannel = async (opts: { name: string; description?: string; visibility?: string; agentIds?: string[]; userIds?: string[] }) => { const r = await api("POST", "/api/channels", { name: opts.name, description: opts.description, visibility: opts.visibility, agentIds: opts.agentIds ?? [], userIds: opts.userIds ?? [] }); if (r?.id) { await reload(); sockRef.current?.emit("join:channel", r.id); } return r?.id ? r : null; };
   const createServer = async (name: string, slug?: string) => { const r = await api("POST", "/api/servers", { name, slug }); if (r?.slug) window.location.assign(`/s/${r.slug}/channel`); }; // create workspace → full-page redirect to re-run bootstrap
-  const logout = () => { localStorage.removeItem("fancy.token"); localStorage.removeItem("fancy.devuser"); window.location.assign("/login"); }; // clear token + dev user → redirect to login (JWT is short-lived; client-side removal is sufficient)
+  const logout = () => { localStorage.removeItem("open-tag.token"); localStorage.removeItem("open-tag.devuser"); window.location.assign("/login"); }; // clear token + dev user → redirect to login (JWT is short-lived; client-side removal is sufficient)
   const markActionExecuted = async (messageId: string, result?: { kind: string; id: string; name: string }) => { await api("POST", `/api/actions/${messageId}/mark-executed`, { result: result ?? null }); };
   const createTasks = async (channelId: string, titles: string[]) => { const r = await api("POST", `/api/tasks/channel/${channelId}`, { tasks: titles.map((title) => ({ title })) }); return r?.tasks || []; };
   const openDM = async (memberType: string, memberId: string) => { const body = memberType === "user" ? { userId: memberId } : { agentId: memberId }; const r = await api("POST", "/api/channels/dm", body); if (r?.id) { await reload(); sockRef.current?.emit("join:channel", r.id); } return r?.id ?? null; };
@@ -138,18 +138,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const syncUnread = () => { if (unreadTimer) clearTimeout(unreadTimer); unreadTimer = setTimeout(async () => { try { setUnread((await api("GET", "/api/channels/unread")) || {}); } catch { /* keep stale value on error */ } }, 400); };
     (async () => {
       const asParam = new URLSearchParams(window.location.search).get("as");
-      const storedToken = localStorage.getItem("fancy.token"); // JWT persisted after real register/login; not set in dev (?as=) flow
+      const storedToken = localStorage.getItem("open-tag.token"); // JWT persisted after real register/login; not set in dev (?as=) flow
       const isAuthRoute = /^\/(login|register|join)\b/.test(window.location.pathname);
       if (isAuthRoute && !storedToken && !asParam) { setReady(true); return; } // auth page without a token: let AuthPage/JoinPage handle its own fetch
       let login: any = null;
       if (storedToken && !asParam) { // real auth token: use stored JWT, fall back to dev-login if expired
         tokenRef.current = storedToken;
         const meRes = await (await fetch("/api/auth/me", { headers: { authorization: "Bearer " + storedToken } })).json().catch(() => null);
-        if (meRes?.id) { setMe(meRes); login = { token: storedToken, user: meRes }; } else localStorage.removeItem("fancy.token");
+        if (meRes?.id) { setMe(meRes); login = { token: storedToken, user: meRes }; } else localStorage.removeItem("open-tag.token");
       }
       if (!login) { // dev-login (?as= user switch or default "you")
-        const asUser = asParam || localStorage.getItem("fancy.devuser") || "you";
-        if (asParam) localStorage.setItem("fancy.devuser", asUser);
+        const asUser = asParam || localStorage.getItem("open-tag.devuser") || "you";
+        if (asParam) localStorage.setItem("open-tag.devuser", asUser);
         login = await (await fetch("/api/auth/dev-login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: asUser }) })).json();
         tokenRef.current = login.token;
         if (login.user) setMe(login.user);

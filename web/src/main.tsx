@@ -14,7 +14,7 @@ import "./styles.css";
 
 // Capture ?as=<devuser> as early as possible: must run before React/Router mounts, otherwise the wildcard route's Navigate replace clears the query string before dev-login can read it.
 const _as = new URLSearchParams(window.location.search).get("as");
-if (_as) localStorage.setItem("fancy.devuser", _as);
+if (_as) localStorage.setItem("open-tag.devuser", _as);
 
 // Root / unmatched path → wait for bootstrap to finish, then redirect to the current user's own workspace (multi-tenant; not hardcoded to "demo").
 function RootRedirect() {

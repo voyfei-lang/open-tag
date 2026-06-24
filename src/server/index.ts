@@ -43,7 +43,7 @@ const server = http.createServer(async (req, res) => {
   const t0 = Date.now();
   res.on("finish", () => log.debug("req", { method, path: url.pathname, status: res.statusCode, ms: Date.now() - t0 }));
   try {
-    if (url.pathname === "/health") return sendJson(res, 200, { ok: true, service: "fancy-loop", time: new Date().toISOString() });
+    if (url.pathname === "/health") return sendJson(res, 200, { ok: true, service: "open-tag", time: new Date().toISOString() });
     if (await handleAgentApi(req, res, url, method)) return;
     if (await handleApi(req, res, url, method)) return;
     // Static frontend (web/dist) + SPA fallback (client-side routing /s/:server/*)
@@ -64,4 +64,4 @@ startReminderScheduler(); // reminder scheduler: fires at due time, wakes the au
 reconcileCounters()
   .then((r) => log.info("counters reconciled", r))
   .catch((e) => log.error("counter reconcile failed (continuing)", { detail: String(e?.message ?? e) }))
-  .finally(() => server.listen(PORT, () => log.info("control plane up", { url: `http://localhost:${PORT}`, logs: "~/.fancy-loop/logs/" })));
+  .finally(() => server.listen(PORT, () => log.info("control plane up", { url: `http://localhost:${PORT}`, logs: "~/.open-tag/logs/" })));

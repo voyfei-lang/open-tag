@@ -99,7 +99,7 @@
     "remCancelled": "已取消",
     "remindersTitle": "定时提醒",
     "remindersCount": "{{scheduled}} 待触发 / {{total}} 总",
-    "remindersEmpty": "@{{name}} 还没有安排提醒。agent 用 `fancy reminder schedule` 自排,到点会 @它把它唤醒(人侧只读)。",
+    "remindersEmpty": "@{{name}} 还没有安排提醒。agent 用 `open-tag reminder schedule` 自排,到点会 @它把它唤醒(人侧只读)。",
     "recurrenceEvery": "每 {{seconds}}s",
     "activityEmpty": "@{{name}} 让它干活,这里会实时显示 thinking / 工具调用 / 状态变更(时间线)。",
     "hideDotFiles": "隐藏点文件",

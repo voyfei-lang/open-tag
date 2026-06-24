@@ -1,24 +1,24 @@
-# 本地后端存储：Postgres(持久) + Redis(seq 计数 / SSE pub-sub / 长轮询)
-# 端口故意避开默认(5433/6380)，免与本机已有 pg/redis 冲突。
+# Local backend storage: persistent Postgres plus Redis for sequence counters,
+# realtime pub/sub, and long polling. Non-default ports avoid local conflicts.
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: fancy-loop-pg
+    container_name: open-tag-pg
     environment:
-      POSTGRES_USER: fancy
-      POSTGRES_PASSWORD: fancy
-      POSTGRES_DB: fancyloop
+      POSTGRES_USER: opentag
+      POSTGRES_PASSWORD: opentag
+      POSTGRES_DB: opentag
     ports: ["5433:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fancy -d fancyloop"]
+      test: ["CMD-SHELL", "pg_isready -U opentag -d opentag"]
       interval: 5s
       timeout: 3s
       retries: 10
 
   redis:
     image: redis:7-alpine
-    container_name: fancy-loop-redis
+    container_name: open-tag-redis
     ports: ["6380:6379"]
     volumes: ["redisdata:/data"]
     healthcheck:

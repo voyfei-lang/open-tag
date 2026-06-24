@@ -11,11 +11,11 @@ async function main() {
   if (existing.length) { console.log("[seed] demo workspace already exists, skipping"); await sql.end(); return; }
 
   const [you] = await db.insert(users).values({
-    name: "you", displayName: "You", email: "you@fancy-loop.local",
+    name: "you", displayName: "You", email: "you@open-tag.local",
   }).returning();
 
   const [server] = await db.insert(servers).values({
-    name: "fancy-loop demo", slug: "demo", ownerId: you!.id, plan: "free",
+    name: "open-tag demo", slug: "demo", ownerId: you!.id, plan: "free",
   }).returning();
 
   await db.insert(serverMembers).values({ serverId: server!.id, userId: you!.id, role: "owner" });

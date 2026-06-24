@@ -199,7 +199,7 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
                 {a.runtimeConfig?.reasoningEffort && <div className="kv"><b>{t("common.reasoning")}</b> {a.runtimeConfig.reasoningEffort}</div>}
                 <div className="kv"><b>{t("common.status")}</b> <span className="kv-v"><span className={"dot " + live} /> {live}</span></div>
                 <div className="kv"><b>{t("common.session")}</b> {a.sessionId || "(none)"}</div>
-                <div className="kv"><b>{t("common.workspace")}</b> ~/.fancy-loop/agents/{a.id}</div>
+                <div className="kv"><b>{t("common.workspace")}</b> ~/.open-tag/agents/{a.id}</div>
                 {capabilities.manageAgents && <div className="task-acts" style={{ marginTop: 14 }}>
                   <button className="joinbtn" onClick={startEdit}>{t("members.editProfile")}</button>
                 </div>}
@@ -352,7 +352,7 @@ function WorkspaceTab({ id }: { id: string }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set()); // tracks expanded directories (collapsed by default, toggled via onToggleDir)
   const [copied, setCopied] = useState(false);
   const [showHidden, setShowHidden] = useState(false); // dot-prefixed files hidden by default (like ls; toggle for ls -a behavior)
-  const root = `~/.fancy-loop/agents/${id}/`; // workspace root path template, matches daemon DATA_DIR
+  const root = `~/.open-tag/agents/${id}/`; // workspace root path template, matches daemon DATA_DIR
   useEffect(() => { setSel(null); setExpanded(new Set()); (async () => { const d = await api("GET", `/api/agents/${id}/workspace-files`); if (d.error) { setErr(d.error); setFiles([]); } else { setErr(""); setFiles(d.files || []); } })(); }, [id]);
   const open = async (f: any) => { setMode("preview"); const d = await api("GET", `/api/agents/${id}/workspace-files/read?path=${encodeURIComponent(f.path)}`); setSel({ path: f.path, content: d.content, error: d.error }); };
   const toggleDir = (path: string) => setExpanded((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n; });
@@ -441,7 +441,7 @@ export function CreateAgentModal({ onClose, prefill, onCreated }: { onClose: () 
 }
 
 // Human member profile (HumanDetailPanel): shows info/role/Created Agents; the member themselves can edit their own description (max 3000 chars).
-// Description is visible to other humans and agents in the server; agents fetch it via `fancy server info` for collaboration context.
+// Description is visible to other humans and agents in the server; agents fetch it via `open-tag server info` for collaboration context.
 function HumanProfile({ uid }: { uid: string }) {
   const { t } = useTranslation();
   const { api, serverId, me, reload, slug, capabilities } = useStore();
