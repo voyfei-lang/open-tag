@@ -455,7 +455,7 @@ export async function setTaskStatus(serverId: string, messageId: string, status:
     .set({ taskStatus: status, taskCompletedAt: finished ? new Date() : null, updatedAt: new Date() })
     .where(and(eq(schema.messages.id, messageId), eq(schema.messages.serverId, serverId))).returning();
   if (!upd) return null;
-  await emitTaskUpdated(serverId, upd); // task message itself updated (taskStatus) → lands in CHANNEL, updates badge + board in channel (recon verified: message:updated/task:updated both in channel)
+  await emitTaskUpdated(serverId, upd); // task message itself updated (taskStatus) → lands in CHANNEL, updates badge + board in channel (verified: message:updated and task:updated both land in the channel)
   // "moved" system message for status change → lands in the task's THREAD, not channel (message:new channelId=task.threadId).
   const actor = by ? await actorName(by.type, by.id) : "Someone";
   // Ensure task has a thread (tasks always have a thread; create now for legacy data / not yet created) → moved system message lands in thread

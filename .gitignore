@@ -8,3 +8,11 @@ logs/
 .DS_Store
 drizzle/
 .claude/settings.local.json
+
+# personal / machine-local dev context — never published
+CLAUDE.local.md
+
+# defensive: never let private lab material into the public repo
+reference/
+recon/
+_vendor/

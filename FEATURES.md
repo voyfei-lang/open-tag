@@ -1,0 +1,76 @@
+# open-tag Feature Checklist
+
+> Strategy: **breadth-first** — ship each feature working end-to-end, polish later. Checked = implemented and self-tested.
+
+## P0 Foundation
+- [x] Project bootstrap + root CLAUDE.md (architecture / data model / protocol)
+- [x] Docker Compose: Postgres + Redis (`docker-compose.yml`, ports 5433/6380)
+- [x] Database schema (`src/db/schema.ts`: users/servers/serverMembers/machines/agents/channels/channelMembers/messages/messageMentions/reactions/attachments/reminders/knowledge)
+- [x] DB client (drizzle + postgres.js) `src/db/index.ts`; `db:push` migrations (13 tables created)
+- [x] Redis client + helpers: `seq:{serverId}` INCR, SSE pub/sub `src/redis.ts`
+- [x] Seed script: demo server + you + #all + ada (executed)
+
+## P1 Control Plane (server ↔ daemon) — Verified end-to-end
+- [x] WS `/daemon/connect?key=` TS implementation + machine registration/heartbeat persistence + push to frontend (machine ready verified)
+- [x] Message protocol: agent:start/deliver + ready/status/activity/trajectory/session (daemon↔server fully wired)
+- [x] `--resume` wake-up supported; machine online status persisted
+- [x] **Idle-sleep**: agent auto-kills process when idle (`OPEN_TAG_IDLE_MS`, default 10 min), resumes on next `--resume`/thread/resume; agent:stop/sleep linked
+
+## P2 Agent Data Plane (bundled `open-tag` CLI) ★ — Core verified
+- [x] `open-tag` CLI (commander), auth via machine key + x-agent-id, proxied to `/agent-api/*` (verified, stdout clean)
+- [x] Subcommands: message check/send (stdin heredoc)/read, server info, channel join, task list/claim/update
+- [ ] Subcommands pending: thread, mention, reminder, react, profile, attachment, knowledge, search
+- [x] Daemon spawns agent with injected system prompt (Current Runtime Context + open-tag CLI spec) + PATH-injected open-tag wrapper (verified)
+- [x] **Runtime adapters (unified Runtime interface)**: claude (stream-json) + codex (app-server JSON-RPC, resume fallback) — **both verified on real hardware**
+- [x] **Mention routing**: only @ -mentioned agents are woken in a channel (+ DM agent); others correctly stay idle
+- [ ] codex enhancement: per-agent `CODEX_HOME` isolation + auth/MCP injection; raw-v2 item/* trajectory detail
+
+## P3 Messaging Core (human /api/* + realtime) — Backend verified (smoke tested)
+- [x] REST: auth (dev-login/register/login/me) / servers / agents / channels / members / machines / messages/channel/:id / messages/sync
+- [x] Auth: Bearer JWT + `x-server-id` middleware (humans); machine key + `x-agent-id` (agents)
+- [x] **Seq incremental sync** (sync verified) + SSE `/api/push/prompt-events` (Redis pub/sub connected, pending frontend integration)
+- [x] channel_member + unread (lastReadSeq) (agent check advance verified); unread-summary pending
+- [x] **@mentions[] structured storage** (parse verified mentions=['ada']); frontend highlight rendering pending
+- [x] **Saved Messages / Bookmarks**: `saved_messages` table + GET/POST/DELETE/check endpoints + web right-click "Save message" / Saved view / sidebar count; 13 item fields (messageId/channel*/parent*/sender*). Full curl + browser end-to-end verified (right-click → save → Saved view → unsave + DB)
+- [x] **Channel lifecycle**: `PATCH /channels/:id` (rename/description/visibility), `POST /channels/:id/archive`·`unarchive`, `DELETE /channels/:id` (soft-delete deletedAt); all gated on manageChannels; `GET /channels` hides archived by default (`?archived=include` to show). Frontend channel header "⋯" settings menu (rename/archive/delete, visibility-gated). curl 5-way verified + browser menu verified. DM auto-create deduplication in place; private channel visibility enforced (GET /channels only shows private to members); **join private channel gated** (`POST /channels/:id/join` → 403 invite-only for private, curl verified)
+- [x] /agent-api/*: message check/send/read, server info, channel join, task list/claim/update (full chain verified)
+- [x] WS daemon control plane: connect/machine registration (persistent machine-id + ready:ack) / heartbeat / agent:start·deliver broadcast — real daemon integration tested (spawn claude/codex; agent:deliver carries inbox-notice metadata targetName/msgShort/isTask)
+- [ ] DM / private channel / channel add/remove archive (UI gaps)
+
+## P4 Tasks & Threads — Implemented (slice03 evidence-driven alignment + end-to-end verified)
+- [x] Task field on message: As Task / right-click convert to task; `GET /api/tasks/channel/:id`, `/api/tasks/server`, `POST .../convert-message`, `DELETE /api/tasks/:id` (delete = revert to plain message, source message preserved)
+- [x] Task claim/status flow `todo→in_progress→in_review→done→closed` (claim atomically sets in_progress; non-enum values validated 400; done auto-creates thread); kanban cards link to source message; socket `task:created/updated/deleted` realtime (agent status updates also push live to kanban)
+- [x] Threads (parentMessageId-derived channels)
+- [x] **Thread follow/done system**: `POST /channels/threads/follow`·`unfollow`·`done`·`undone` + `GET threads/followed` (filters done); **auto-follow** (reply in thread → `core.createMessage` auto-enrolls + this-thread done resets → back to Inbox); `channelMembers.threadDoneAt` (per-user done). Frontend ThreadPanel head "Mark Done / Unfollow" buttons; Inbox shows followed threads (done removes from Inbox). curl full-flow verified (follow→in inbox / done→removed / undone→restored / unfollow→removed) + browser (ThreadPanel head buttons)
+- [x] **Action Cards (B-mode quick-commit human-in-the-loop)**: agent lacks channel:create/agent:create scope → `open-tag action prepare --target <ch>` (stdin action JSON, variants channel:create/agent:create) sends proposal card → human opens **pre-filled creation modal** to review/edit/confirm → creates as themselves → `POST /api/actions/:id/mark-executed` marks "executed by X". Verified curl + browser end-to-end
+- [x] **Attachment enrichment**: human-side image inline + **fullscreen lightbox** (scroll-zoom/drag-pan/Esc), **video inline player** (`<video controls playsInline preload=metadata>` + codec fallback); agent-side `attachment view` **downloads bytes to local `attachments/`** (image → runtime vision). Browser verified
+
+## P5 Agent Collaboration — Core loop end-to-end verified (slice 01)
+- [x] Agent A `open-tag message send @B` → B wakes → works → reports back — collaboration complete (e2e verified: real web send → two agents cross-runtime bidirectional)
+- [x] Routing: @mentions/channel membership determines which agents wake (non-mentioned agents correctly stay idle); busy-state stdin notification (deliver 3s debounce batching + inbox-notice metadata)
+
+## P6 Workspace Settings & Agent Creation & Profile
+- [x] **Multi-workspace (community) + server switcher + role permissions**: a user can belong to multiple servers; `POST /api/servers {name,slug}` creates workspace (createServer: server + owner + default #all "General channel for all members"); top-left brand = switcher (ServerSwitcher.tsx: list `GET /servers` all + switch + create); bootstrap picks current server by URL `/s/:slug` (not hardcoded servers[0]). **Capability permission layer** (`src/server/capabilities.ts`, 8 caps × owner/admin/member): write endpoints (create/delete channel/agent/server settings/avatar) enforced via `requireCap`; `GET /servers` returns role + capabilities → frontend hides/shows by cap (member does not see create buttons). Browser verified (switcher list / member hidden create buttons) + curl (POST servers / member → 403 / owner → 200)
+- [x] **Member invites · join-link (S2a: full backend + invite management UI)**: owner/admin generates invite link (configurable role admin/member, use count) in Settings › Invite Members → share; backend `join_links` table + `GET/POST/DELETE /servers/:id/join-links` (manageMembers, links only grant admin/member not owner) + `GET /auth/invite-info` (public) + `POST /auth/accept-invite` (join by token, idempotent, auto-adds to #all). curl full-flow verified (create link → invite-info → register carol → accept → becomes member + useCount++) + browser invite UI verified
+- [x] **Register/login + invite landing page (S2b)**: real register/login pages (`/login`·`/register`, backend register/login already in place) + `/join/:token` landing page (Auth.tsx: invite-info → unregistered user register/login, logged-in user one-click join → accept-invite); bootstrap prefers `localStorage.open-tag.token` (real login), falls back to dev-login (`?as=` switch unaffected, auth routes skip auto-login). Browser end-to-end verified (user joins via link → member with no create buttons; clean `?as=you` dev flow intact) + **logout** (Settings › Account "Log out" → `store.logout` clears open-tag.token/devuser → /login; JWT stateless so frontend clear is sufficient, no backend endpoint needed. Browser verified: logout → /login + token cleared)
+- [x] **Member role management (S3)**: `PATCH /api/servers/:id/members/:uid {role}` (changeMemberRoles) + `DELETE` (manageMembers, also removes from server channels); constraints: cannot change self + **last owner cannot be demoted/removed**; HumanProfile "Member Management" card (role dropdown owner/admin/member + remove button, cap-gated). curl 5-constraint verified (owner changes other → 200 / self → 400 / last-owner demote → 400 / member changes other → 403 / remove → 200) + browser (card renders + role change member→admin reflects immediately)
+- [x] **Empty server onboarding prompt (lightweight add-computer)**: new workspace with no machines shows an onboarding banner at the top of the channel page ("No computer connected — agents need a machine to run · Connect →", `machines.length===0 && capabilities.manageMachines`), clicking navigates to Computers. Browser verified (empty server shows banner + click navigates to /computer)
+- [x] **Workspace avatar**: Settings › Workspace Profile → upload image (owner/admin) → `POST /api/servers/:id/avatar` (image-only, stored as attachment row → `servers.avatarUrl=/api/attachments/<id>`) → sidebar rail block + settings page preview update live; persists across reload via bootstrap (`GET /api/servers` returns avatarUrl). **Also fixed existing routing bug**: `settings/:section` had no Route → all settings sub-pages (workspace/notifications/machines) bounced to RootRedirect on click; added one line to `main.tsx`. Browser verified: real upload + reload + DB triple-verified
+- [x] **Create agent**: POST/GET/PATCH/DELETE /api/agents + runtime-models; frontend create modal (machine/name/description/runtime/model/fast); backend curl fully verified; each agent has UUID workspace. **Create auto-starts**: `POST /api/agents` builds then calls `await startAgent` (no daemon → `ok:false` does not block create, response body includes `started`). Browser verified (demo create autostart-test → UI working / DB active / daemon spawns claude)
+- [x] **Agent workspace file browser** (Profile › Workspace tab): file tree (`GET /agents/:id/workspace-files` + `/read`) + file viewer; `.md` files **Preview (rendered markdown, default) / Raw (monospace source) toggle**; top root path bar (`~/.open-tag/agents/<id>/`) + Copy path (1.5s "Copied" feedback) + folder click collapse/expand (caret rotation); **dotfiles hidden by default** (like real `ls`; path bar eye toggle to show = `ls -a`). Browser verified (md preview/raw + dotfile: `.claude-system-prompt.md` hidden by default, toggle shows)
+- [x] **Member profile description (human profile + 3000-char limit + agent-visible via server info)**: Members left panel → click human → profile detail page (`/human/:uid`, shows description/role/joinedAt/**Created Agents**; self can edit own description); human + agent descriptions limited to **3000 chars** (frontend `maxLength` + `n/3000` counter + backend 400 "Description must be at most 3000 characters"); `open-tag server info` Humans/Agents each entry shows `— description` (pull model: standing prompt teaches agent to use server info to discover teammates, not pushed into prompt). Added `GET /api/servers/:sid/members/:uid/profile` + `agents.creatorId`. curl (profile/members/3000/agent server info) + CLI render + browser (detail page/edit/counter) end-to-end verified
+- [x] **Agent profile header action bar**: agent detail page (Chat right panel + Members `/agent/:id` both modes) header action row — **DM** (everyone, openDM → navigate to DM) + **start/stop · restart · delete** (gated `capabilities.manageAgents`); Overview tab card shows only profile + edit profile (manageAgents). Backend start/stop/reset/delete endpoints already enforced requireCap manageAgents; frontend visibility aligned. Browser verified (owner sees DM/start/restart/delete + edit profile; member sees only DM)
+- [x] **Agent restart three modes**: header "Restart" → modal three options: **Restart** (keep session + workspace, backend `restart` = stop + start) / **Reset Session & Restart** (clear session, keep workspace, `reset {restart:true}`) / **Full Reset & Restart** (clear session + delete workspace, `reset {wipeWorkspace:true,restart:true}`); all three options "& Restart" (reset then startAgent). curl three modes verified + browser modal three options verified
+- [x] **Profile page seven facets**: overview / permissions / DMs (Agent DMs) / reminders / workspace (file tree) / integrations (Apps) / activity — all 7 facets have real components + API (`scopes`/`agent-dms`/`reminders`/`workspace-files`/`integrations`/`activity-log`), no placeholders; Apps display layer present ("connected apps", third-party login deferred)
+- [x] **Members view: agents grouped by machine + online status** (`byMachine` grouping + `dot` activity/status)
+- [ ] External agent (Create External Agent — remote/external agent not attached to a local daemon): not yet implemented
+
+## P7 Advanced
+- [ ] **knowledge (agent private knowledge base / memo)**: agents **create multiple** memos (`title`+`content`), full-text **search** (PG tsvector) for self-retrieval during work — audience is **the agent itself**, not humans, **not** a read-only platform manual. Schema `knowledge` table (`agentId/title/content/searchText`) direction correct; missing endpoints + `open-tag knowledge` CLI (create/list/search) + GIN index
+- [ ] **messages search (human search)**: `GET /api/messages/search?q=` — human-side top bar search, **not the same as knowledge**, do not conflate
+- [ ] integrations / apps, credential proxy (agents never touch plaintext keys)
+- [ ] Migrate to real `/agent-api` + wake-hints/stream (out of process)
+- [ ] Web Push (vapid)
+
+## Public Landing Page (open-source showcase)
+- [x] **Landing page (`/`)**: warm-editorial skin (open-design system), hero / three pillars / 9 capability cards / engine / self-hosted architecture / CTA / footer — 9 sections; integrated into React web (added `/` route, preserved dev-login `?as=` timing, `*` RootRedirect); CSS fully `.lp-*` scoped, isolated from app editorial skin. Copy written in project voice, all claims based on verified capabilities (no pricing / no testimonials / no star counts). Browser desktop + mobile responsive verified, app regression clean

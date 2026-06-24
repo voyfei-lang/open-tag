@@ -56,8 +56,7 @@ its own iterative improvement — autonomously.
 ## Current state (one line)
 
 - **Primary stack = `src/` (TypeScript) + `web/` (React + Vite)** + `docker compose`
-  (Postgres + Redis). Root-level `*.mjs` files are **deprecated PoC stubs**
-  (kept only for `poc:*` scripts); all new code goes in `src/`. See `ARCHITECTURE.md` §VI.
+  (Postgres + Redis). All backend code lives in `src/`, the frontend in `web/`.
 - Verified working: two runtimes (claude / codex), agent lifecycle (including idle-sleep),
   multi-agent collaboration, group chat / task board / threads / member groups.
   Evidence in `README.md` "Verified" section.
