@@ -278,9 +278,16 @@ main.content-col{display:flex;flex-direction:column;height:100vh;background:var(
 .card.card-link:focus-visible{outline:2px solid var(--g-sky);outline-offset:2px}
 .composer .astask.on{color:var(--ink);font-weight:600}
 /* Board layout: horizontal Kanban (columns side by side, min-width + horizontal scroll so the narrow embedded tasks tab degrades gracefully) vs the legacy vertical stack. Toggle persisted in localStorage. */
-.task-board.columns{display:flex;gap:14px;align-items:flex-start;overflow-x:auto;padding-bottom:6px}
-.task-board.columns .task-col{flex:0 0 300px;min-width:280px;margin-bottom:0}
-.task-board.columns .task-col.collapsed{flex:0 0 auto;min-width:0} /* a collapsed column shrinks to its header instead of leaving a wide empty slot */
+/* The tasks pane is a flex column so the board fills the height left under the toolbar (instead of being only as tall as its cards). */
+.board-scroll{display:flex;flex-direction:column;min-height:0}
+.task-col{display:flex;flex-direction:column;min-height:0} /* flex container so its body can fill the lane and scroll its own cards */
+/* Horizontal Kanban: full-height equal lanes (Trello/Linear) — the board fills the pane and every column spans it,
+   so the WHOLE column (not just the title strip or the cards) is a drop target. Each lane is a soft surface so the
+   columns read as distinct containers, with white cards sitting inside. */
+.task-board.columns{display:flex;gap:14px;align-items:stretch;overflow-x:auto;padding-bottom:6px;flex:1 1 auto;min-height:0}
+.task-board.columns .task-col{flex:0 0 300px;min-width:280px;margin-bottom:0;background:var(--surface-strong);border-radius:14px;padding:2px 10px 10px}
+.task-board.columns .task-col .sec{margin:12px 4px 8px} /* tighter header inside the padded lane */
+/* collapsed columns are still full-height containers like the others (consistent lanes) — they just hide their cards */
 .task-board.stack .task-col{margin-bottom:20px}
 /* Task card: #channel + #number + title + bottom-right status pill, no avatar/timestamp (editorial style) */
 .card.task{position:relative;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:transform .1s,border-color .1s}
@@ -290,7 +297,7 @@ main.content-col{display:flex;flex-direction:column;height:100vh;background:var(
 .tk-chan{font-size:12px;color:var(--muted)} .tk-chan-dm{color:var(--ink);font-weight:500} .tk-num{font-size:11px;color:var(--muted-soft);letter-spacing:.3px}
 .tk-title{font-size:14px;font-weight:600;color:var(--ink);line-height:1.35;margin:3px 24px 8px 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .tk-foot{display:flex;justify-content:flex-end}
-.st-pill-wrap{position:relative} .st-pill-btn{border:0;background:transparent;padding:0;cursor:pointer}
+.st-pill-btn{border:0;background:transparent;padding:0;cursor:pointer}
 .st-pill{display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:600;padding:1px 9px;border-radius:9999px;border:1px solid var(--hair-strong);color:var(--muted)}
 .st-pill.st-todo{color:var(--amber);border-color:var(--amber)}
 .st-pill.st-in_progress{color:var(--tint-blue-ink);border-color:var(--g-sky)}
@@ -305,9 +312,20 @@ main.content-col{display:flex;flex-direction:column;height:100vh;background:var(
 .st-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--muted-soft)}
 .st-dot.st-todo{background:var(--amber)} .st-dot.st-in_progress{background:var(--g-sky)} .st-dot.st-in_review{background:var(--g-lav)} .st-dot.st-done{background:var(--success)} .st-dot.st-closed{background:var(--muted-soft)}
 .tk-del-row{border:0;background:transparent;color:var(--muted-soft);cursor:pointer;padding:4px;border-radius:6px;flex:none} .tk-del-row:hover{color:var(--error)}
-/* D6 drag-and-drop: target column highlight + drop hint (editorial sky dashed) */
-.task-col.drop-over{background:var(--surface-strong);border-radius:12px;outline:2px dashed var(--g-sky);outline-offset:-2px}
-.drop-hint{font-size:12px;font-weight:600;color:var(--tint-blue-ink);text-align:center;padding:9px;border:1px dashed var(--g-sky);border-radius:8px;margin-bottom:6px;background:var(--tint-blue)}
+/* Drag-and-drop + click-to-move: the whole column is the drop target (not just the title strip), and the
+   drop indicator is appended after the cards so it never overlaps them. Editorial sky dashed affordance. */
+.task-col-body{flex:1 1 auto;min-height:0;overflow-y:auto} /* fills the lane (so the whole column is the drop target) and scrolls its own cards when they overflow */
+.task-board.stack.dragging .task-col-body{min-height:96px} /* stack columns are full-width; a 96px body is a generous target (columns layout fills the full lane height instead) */
+.task-board.columns .task-col.drop-over{background:var(--tint-blue);border-radius:14px;outline:2px dashed var(--g-sky);outline-offset:-2px} /* stands out from the resting surface-strong lane */
+.task-board.stack .task-col.drop-over{background:var(--surface-strong);border-radius:12px;outline:2px dashed var(--g-sky);outline-offset:-2px}
+.drop-slot{display:flex;align-items:center;justify-content:center;min-height:62px;font-size:12px;font-weight:600;color:var(--tint-blue-ink);text-align:center;padding:10px;border:1.5px dashed var(--g-sky);border-radius:12px;background:var(--tint-blue);margin-top:2px}
+/* FLIP move animation: a card slides from its old column to its new one (set imperatively in TaskBoard) */
+.tk-slot{transition:transform .22s cubic-bezier(.22,1,.36,1),opacity .22s ease}
+@media (prefers-reduced-motion:reduce){.tk-slot{transition:none}}
+/* DragOverlay: the moving copy of the card lifts off the board — soft shadow + slight scale, never clipped (it's portaled to <body>). */
+.card-overlay{cursor:grabbing;transform:scale(1.03);box-shadow:0 16px 36px rgba(12,10,9,.20)}
+.card-overlay .card.task{margin-bottom:0;border-color:var(--hair-strong)}
+@media (prefers-reduced-motion:reduce){.card-overlay{transform:none}}
 .actlog{display:flex;flex-direction:column;gap:2px}
 .act{display:flex;align-items:baseline;gap:10px;padding:5px 6px;border-radius:6px;font-size:14px;line-height:1.5}
 .act:hover{background:var(--surface-strong)}
