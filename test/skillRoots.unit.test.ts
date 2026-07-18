@@ -21,25 +21,31 @@ test("codex resolves ~/.codex/skills and not Claude's dir", () => {
   assert.ok(!r.global.some((g) => posix(g.dir).endsWith("/.claude/skills")), "codex must not read ~/.claude/skills");
 });
 
-test("opencode/cursor/pi resolve their own nested provider dirs", () => {
+test("opencode/cursor/pi/hermes/kimi resolve their own nested provider dirs", () => {
   assert.ok(skillRootsFor("opencode", "a").global.some((g) => posix(g.dir).endsWith("/.config/opencode/skills")));
   assert.ok(skillRootsFor("cursor", "a").global.some((g) => posix(g.dir).endsWith("/.cursor/skills")));
   assert.ok(skillRootsFor("pi", "a").global.some((g) => posix(g.dir).endsWith("/.pi/agent/skills")));
+  if (process.platform === "win32") {
+    assert.ok(skillRootsFor("hermes", "a").global.some((g) => posix(g.dir).endsWith("Local/hermes/skills")), "hermes on Windows uses %LOCALAPPDATA%/hermes/skills");
+  } else {
+    assert.ok(skillRootsFor("hermes", "a").global.some((g) => posix(g.dir).endsWith("/.hermes/skills")), "hermes on non-Windows uses ~/.hermes/skills");
+  }
+  assert.ok(skillRootsFor("kimi", "a").global.some((g) => posix(g.dir).endsWith("/.kimi-code/skills")));
 });
 
 test("every runtime also includes the universal ~/.agents/skills convention", () => {
-  for (const rt of ["claude", "codex", "opencode", "cursor", "pi", "copilot", "kimi"]) {
+  for (const rt of ["claude", "codex", "opencode", "cursor", "pi", "copilot", "hermes", "kimi"]) {
     assert.ok(skillRootsFor(rt, "a").global.some((g) => posix(g.dir).endsWith("/.agents/skills")), rt);
   }
 });
 
-test("kimi/unknown runtime falls back to the universal dir only (no invented provider dir)", () => {
-  assert.deepEqual(skillRootsFor("kimi", "a").global.map((g) => g.label), ["~/.agents/skills"]);
+test("unknown runtime falls back to the universal dir only (no invented provider dir)", () => {
   assert.deepEqual(skillRootsFor("totally-unknown", "a").global.map((g) => g.label), ["~/.agents/skills"]);
 });
 
 test("workspace root mirrors the runtime's project-local provider dir", () => {
   assert.ok(posix(skillRootsFor("claude", "agent-1").workspace?.dir ?? "").endsWith("agent-1/.claude/skills"));
   assert.ok(posix(skillRootsFor("codex", "agent-1").workspace?.dir ?? "").endsWith("agent-1/.codex/skills"));
-  assert.equal(skillRootsFor("kimi", "agent-1").workspace, null);
+  assert.ok(posix(skillRootsFor("hermes", "agent-1").workspace?.dir ?? "").endsWith("agent-1/.hermes/skills"));
+  assert.ok(posix(skillRootsFor("kimi", "agent-1").workspace?.dir ?? "").endsWith("agent-1/.skills"), "kimi workspace dir is .skills/ (without /skills/ subfolder): " + (skillRootsFor("kimi", "agent-1").workspace?.dir ?? "null"));
 });

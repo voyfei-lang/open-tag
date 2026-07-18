@@ -9,6 +9,28 @@ from `main`; see commit history for fine-grained server/web changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Personality upload/delete (server + web UI)**: `GET/PUT/DELETE /api/agents/:id/personality` endpoints gate on `manageAgents`; the Profile tab now shows current `personality.md` content with Upload .md and Delete buttons. Uploaded files are auto-renamed to `personality.md` in the agent workspace; after write/delete the daemon re-syncs MEMORY.md `## Role` via `syncProfile()`.
+- **Skills upload/delete (server + web UI)**: `PUT/DELETE /api/agents/:id/skills/:name` endpoints gate on `manageAgents`; the Skills section shows a "+ Skill" button. Uploaded `.md` files without frontmatter get auto-generated YAML (`name` + `userInvocable: true`). Workspace-scoped skills have a ✕ delete button; global skills are read-only.
+- **Daemon workspace file write/delete**: `writeWorkspaceFile()` / `deleteWorkspaceFile()` exports in `workspace.ts`, wired as `agent:workspace:write` / `agent:workspace:delete` WS-RPC cases in the daemon message dispatcher. Used by the personality and skills endpoints.
+- **Auto-frontmatter for skill uploads**: when a `.md` file without frontmatter is uploaded, the frontend prepends `---\nname: <skillName>\nuserInvocable: true\n---` so the skill is immediately recognized by the daemon's `readSkillsDir()`.
+
+## [0.10.0] — 2026-07-11
+
+### Added
+
+- **Dynamic memory pressure system**: replaced static per-agent resource limits with system-wide memory pressure management. When free memory drops below 500 MB (`OPEN_TAG_PRESSURE_MEM_MB`), new agents are queued and running agents are capped at their current RSS + a fair-share margin. The Windows Job Object and Linux cgroup handles are still created for pressure-ready enforcement.
+
+## [0.9.1] — 2026-07-10
+
+### Added
+
+- **Personality override**: place a `personality.md` file in the agent workspace
+  (`~/.open-tag/agents/<agent-id>/`) to inject a detailed persona into the system
+  prompt and MEMORY.md `## Role` section, overriding the agent's `description`
+  field. Compatible with agency-agents personality files and any runtime.
+
 ## [0.9.0] — 2026-07-06
 
 ### Added
@@ -206,7 +228,10 @@ from `main`; see commit history for fine-grained server/web changes.
   on any machine with Node ≥ 20, without cloning the repository.
 - Supported runtimes at time of release: **Claude Code** and **Codex**.
 
-[Unreleased]: https://github.com/fancyboi999/open-tag/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/fancyboi999/open-tag/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/fancyboi999/open-tag/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/fancyboi999/open-tag/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/fancyboi999/open-tag/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/fancyboi999/open-tag/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/fancyboi999/open-tag/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/fancyboi999/open-tag/compare/v0.8.0...v0.8.1

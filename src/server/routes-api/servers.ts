@@ -185,6 +185,16 @@ export async function handleServersServerScope(ctx: ServerCtx): Promise<boolean>
     const machines = await db.select().from(schema.machines).where(eq(schema.machines.serverId, serverId));
     return (sendJson(res, 200, { machines: machines.map((m) => ({ id: m.id, name: m.name, hostname: m.hostname, os: m.os, runtimes: m.runtimes, status: m.status, daemonVersion: m.daemonVersion, isComputer: m.isComputer, apiKeyPrefix: m.apiKeyPrefix, lastHeartbeat: m.lastHeartbeat })), latestDaemonVersion: LATEST_DAEMON_VERSION }), true);
   }
+  // Machine budget (GET /api/servers/:id/machines/:id/budget) — WS-RPC to the daemon
+  const bm = /^\/api\/servers\/[^/]+\/machines\/([^/]+)\/budget$/.exec(p);
+  if (bm && method === "GET") {
+    const machineId = bm[1]!;
+    const owns = (await db.select({ id: schema.machines.id }).from(schema.machines).where(and(eq(schema.machines.id, machineId), eq(schema.machines.serverId, serverId))))[0];
+    if (!owns) return (sendErr(res, 404, "machine not found"), true);
+    const { requestDaemonByMachine } = await import("../daemonHub.js");
+    const result = await requestDaemonByMachine(machineId, { type: "agent:resource-budget" });
+    return (sendJson(res, 200, result), true);
+  }
   // Notification settings (GET/PATCH /api/servers/:id/notification-settings): per-user push mute setting for this server
   const nset = /^\/api\/servers\/[^/]+\/notification-settings$/.exec(p);
   if (nset && (method === "GET" || method === "PATCH" || method === "PUT")) {

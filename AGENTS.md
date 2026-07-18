@@ -35,7 +35,7 @@ its own iterative improvement — autonomously.
 ## Conventions
 
 - TypeScript throughout. Run `npm run typecheck` (root + web) before committing.
-- Agent workspace lives at `~/.open-tag/agents/<agent-id>/` with a `MEMORY.md` per agent.
+- Agent workspace lives at `~/.open-tag/agents/<agent-id>/` with a `MEMORY.md` per agent. Optionally, a `personality.md` file in the same directory overrides the agent's `description` field — place an agency-agents personality file (e.g. from `~/.open-tag/agency-agents/`) there to inject a detailed persona into the system prompt and MEMORY.md `## Role` section.
 - Screenshots / browser-verification captures go in `.shots/` (gitignored — never commit them).
 
 ## Parallel development (worktrees)
@@ -171,6 +171,11 @@ Three separate auth planes — do not conflate them (`src/server/auth.ts`):
 - **human** → JWT (`signUser`/`verifyUser`), endpoints under `/api/auth/*`.
 - **agent** → per-agent token (`Bearer sk_agent_*` + `x-agent-id`), `resolveAgent`, `/agent-api/*`.
 - **daemon** → bootstrap/machine key over WS `/daemon/connect?key=` (`ws.ts`).
+
+Resource-control env vars (optional):
+- `OPEN_TAG_PRESSURE_MEM_MB` (default 500) — when free system memory drops below this (MB), new
+  agents are queued and running agents receive a per-process cap at their current RSS + fair-share
+  margin via the Job Object or cgroup. See `src/daemon/resourceBudget.ts`.
 
 Required env vars — server **will not start** without these:
 - `JWT_SECRET` — signing key for human session JWTs. Generate: `openssl rand -hex 32`.

@@ -9,6 +9,8 @@ import { getRuntime } from "./runtimes.js";
 import type { Runtime, RuntimeSession, RuntimeCallbacks } from "./runtime.js";
 import { createLogger } from "../log.js";
 import { agentsDir } from "../paths.js";
+import { ResourceBudget, PRESSURE_MEM_MB } from "./resourceBudget.js";
+import { readProcessMemoryMB, applyMemoryPressure } from "./resourceLimit.js";
 
 const DATA_DIR = agentsDir();
 const IDLE_MS = Number(process.env.OPEN_TAG_IDLE_MS ?? 10 * 60 * 1000); // how long before idle sleep (kills process to save memory; next wake uses --resume)
@@ -23,7 +25,8 @@ export interface AgentConfig {
 }
 interface DeliverBuf { count: number; from: string; target: string; targetName: string; firstShort: string; latestShort: string; isTask: boolean; mentioned: boolean; targets: Set<string>; timer: ReturnType<typeof setTimeout>; streamId?: string; }
 export interface DeliverMeta { targetName?: string; msgShort?: string; isTask?: boolean; streamId?: string; }
-interface Running { session: RuntimeSession; config: AgentConfig; sessionId: string | null; idleTimer?: ReturnType<typeof setTimeout>; deliverBuf?: DeliverBuf; }
+interface Running { session: RuntimeSession; config: AgentConfig; sessionId: string | null; idleTimer?: ReturnType<typeof setTimeout>; deliverBuf?: DeliverBuf; pid: number; }
+interface QueuedStart { agentId: string; config: AgentConfig; enqueuedAt: number; }
 interface PendingDeliver { from: string; target: string; mentioned: boolean; meta: DeliverMeta; }
 interface PendingDeliverQueue { items: PendingDeliver[]; timer: ReturnType<typeof setTimeout>; }
 interface ActiveReplyPreview { channelId: string; streamId: string; name: string; }
@@ -34,6 +37,7 @@ interface AgentManagerOptions {
   oneShotDeliverDebounceMs?: number;
   pendingDeliverTtlMs?: number;
   runtimeResolver?: (name: string) => Runtime | null;
+  budget?: ResourceBudget;
 }
 
 export class AgentManager {
@@ -48,24 +52,102 @@ export class AgentManager {
   private oneShotDeliverDebounceMs: number;
   private pendingDeliverTtlMs: number;
   private runtimeResolver: (name: string) => Runtime | null;
+  private budget: ResourceBudget;
+  private startQueue: QueuedStart[] = [];
   private log = createLogger("daemon:agents");
   constructor(private send: (msg: unknown) => void, opts: AgentManagerOptions = {}) {
+    this.budget = opts.budget ?? new ResourceBudget();
     this.binDir = opts.binDir ?? ensureOpenTagBin();
     this.dataDir = opts.dataDir ?? DATA_DIR;
     this.deliverDebounceMs = opts.deliverDebounceMs ?? DELIVER_DEBOUNCE_MS;
     this.oneShotDeliverDebounceMs = opts.oneShotDeliverDebounceMs ?? ONE_SHOT_DELIVER_DEBOUNCE_MS;
     this.pendingDeliverTtlMs = opts.pendingDeliverTtlMs ?? PENDING_DELIVER_TTL_MS;
     this.runtimeResolver = opts.runtimeResolver ?? getRuntime;
+    // Memory pressure monitor: every 10s, cap running agents if free < 500 MB
+    setInterval(() => this.checkMemoryPressure(), 10_000);
+  }
+
+  private checkMemoryPressure(): void {
+    const freeMB = this.budget.availableMemMB();
+    if (freeMB >= PRESSURE_MEM_MB) { this.tryDequeue(); return; }
+    const agentCount = Math.max(this.agents.size, 1);
+    const margin = Math.ceil(400 / agentCount);
+    this.log.warn("memory pressure detected", { freeMB, threshold: PRESSURE_MEM_MB, margin, agentCount });
+    for (const [id, r] of this.agents) {
+      const pid = r.session.pid ?? r.pid;
+      if (pid <= 0) continue;
+      const actual = readProcessMemoryMB(pid);
+      if (actual > 0) {
+        this.log.info("pressure: capping agent", { agentId: id, pid, actualMB: actual, limitMB: actual + margin });
+        applyMemoryPressure(pid, actual, margin);
+      }
+    }
+    // macOS has no cgroup/job-object support — capping above is a no-op.
+    // Sleep the heaviest agent and auto-enqueue it so tryDequeue() resumes it
+    // once memory recovers.
+    if (process.platform === "darwin" && this.agents.size > 0) {
+      let maxRss = -1, maxId = "";
+      for (const [id, r] of this.agents) {
+        const pid = r.session.pid ?? r.pid;
+        if (pid <= 0) continue;
+        const rss = readProcessMemoryMB(pid);
+        if (rss > maxRss) { maxRss = rss; maxId = id; }
+      }
+      if (maxId) {
+        const config = this.agents.get(maxId)?.config;
+        if (config && !this.startQueue.some((q) => q.agentId === maxId)) {
+          this.startQueue.push({ agentId: maxId, config, enqueuedAt: Date.now() });
+        }
+        this.budget.queueLength = this.startQueue.length;
+        this.log.warn("darwin: sleeping heaviest agent to relieve memory pressure", { agentId: maxId, rssMB: maxRss });
+        this.sleep(maxId);
+      }
+    }
   }
 
   running(): string[] { return [...this.agents.keys()]; }
   stopAll(): void { for (const id of [...this.agents.keys()]) this.stop(id); }
+  budgetStatus() {
+    let actualMemMB = 0;
+    for (const r of this.agents.values()) {
+      const pid = r.session.pid ?? r.pid;
+      if (pid > 0) actualMemMB += readProcessMemoryMB(pid);
+    }
+    this.budget.agentCount = this.agents.size;
+    this.budget.actualUsedMemMB = actualMemMB;
+    return this.budget.status();
+  }
+  queuedAgents(): QueuedStart[] { return [...this.startQueue]; }
+  /** Remove a queued start request (user cancelled). */
+  dequeue(agentId: string): void {
+    const idx = this.startQueue.findIndex((q) => q.agentId === agentId);
+    if (idx === -1) return;
+    this.startQueue.splice(idx, 1);
+    this.budget.queueLength = this.startQueue.length;
+    this.send({ type: "agent:status", agentId, status: "inactive" });
+    this.send({ type: "agent:activity", agentId, activity: "offline", detail: "dequeued" });
+    this.log.info("dequeued", { agentId });
+  }
+
   // Tear down process: clear timers + remove from map first (critical: deletion before session.stop() lets the onExit has() guard recognize this as an intentional stop, suppressing unexpected sleeping status) + stop runtime. Returns whether the agent was found.
-  private teardown(agentId: string): boolean { this.clearPendingDeliver(agentId); this.finishReplyPreview(agentId); const r = this.agents.get(agentId); if (!r) return false; if (r.idleTimer) clearTimeout(r.idleTimer); if (r.deliverBuf) clearTimeout(r.deliverBuf.timer); this.agents.delete(agentId); r.session.stop(); return true; }
+  private teardown(agentId: string): boolean { this.clearPendingDeliver(agentId); this.finishReplyPreview(agentId); const r = this.agents.get(agentId); if (!r) return false; if (r.idleTimer) clearTimeout(r.idleTimer); if (r.deliverBuf) clearTimeout(r.deliverBuf.timer); this.agents.delete(agentId); this.tryDequeue(); r.session.stop(); return true; }
   // User-initiated stop: emits inactive/offline
   stop(agentId: string): void { if (!this.teardown(agentId)) return; this.send({ type: "agent:status", agentId, status: "inactive" }); this.send({ type: "agent:activity", agentId, activity: "offline", detail: "" }); }
   // Idle sleep: emits sleeping/sleeping (activity also set to sleeping so the frontend activity+status dual mapping stays consistent; session is preserved for --resume on next wake)
   sleep(agentId: string): void { if (!this.teardown(agentId)) return; this.log.info("sleep", { agentId }); this.send({ type: "agent:status", agentId, status: "sleeping" }); this.send({ type: "agent:activity", agentId, activity: "sleeping", detail: "" }); }
+  /** Try to start the next queued agent if budget allows. */
+  private tryDequeue(): void {
+    if (this.startQueue.length === 0) return;
+    const q = this.startQueue[0]!;
+    if (!this.budget.tryAllocate()) return;
+    this.startQueue.shift();
+    const agentId = q.agentId;
+    this.budget.queueLength = this.startQueue.length;
+    this.log.info("dequeue -> start", { agentId });
+    this.send({ type: "agent:status", agentId, status: "inactive" });
+    void this.startNow(agentId, q.config).finally(() => { this.starting.delete(agentId); this.budget.release(); });
+  }
+
   /** Reset: stop the process + clear the server-side session (next start will not --resume); wipeWorkspace deletes the entire workspace; clearMemory clears MEMORY.md only. */
   async reset(agentId: string, wipeWorkspace = false, clearMemory = false): Promise<void> {
     this.teardown(agentId); // skip stop() to avoid double inactive emit; reset sends its own inactive/offline+detail=reset below
@@ -90,7 +172,12 @@ export class AgentManager {
     let content: string;
     try { content = await readFile(mem, "utf8"); }
     catch { this.log.debug("syncProfile: no MEMORY.md yet", { agentId }); return; }
-    const next = applyProfileToMemory(content, displayName || agentId, description);
+    let effectiveDesc = description;
+    try {
+      const f = await readFile(path.join(this.dataDir, agentId, "personality.md"), "utf8");
+      if (f.trim()) effectiveDesc = f;
+    } catch {}
+    const next = applyProfileToMemory(content, displayName || agentId, effectiveDesc);
     if (next !== content) {
       try { await writeFile(mem, next); this.log.info("profile synced to MEMORY.md", { agentId }); }
       catch (e) { this.log.warn("syncProfile write failed", { agentId, detail: String(e) }); return; }
@@ -132,15 +219,39 @@ export class AgentManager {
     if (!preview) return;
     this.activeReplyPreviews.delete(agentId);
     this.send({ type: "agent:reply", agentId, channelId: preview.channelId, streamId: preview.streamId, name: preview.name, op });
+    // Queue is waiting → sleep this agent so the next one can run
+    if (op === "done" && this.startQueue.length > 0) {
+      const r = this.agents.get(agentId);
+      if (r) {
+        this.log.info("reply done, queue waiting — sleeping agent", { agentId });
+        this.sleep(agentId);
+      }
+    }
   }
 
   async start(agentId: string, config: AgentConfig): Promise<void> {
     if (this.agents.has(agentId)) return;
     const existing = this.starting.get(agentId);
     if (existing) return existing;
-    const pending = this.startNow(agentId, config).finally(() => this.starting.delete(agentId));
-    this.starting.set(agentId, pending);
-    return pending;
+    // Already queued — update config and return
+    if (this.startQueue.some((q) => q.agentId === agentId)) {
+      const idx = this.startQueue.findIndex((q) => q.agentId === agentId);
+      if (idx !== -1) this.startQueue[idx]!.config = config;
+      return;
+    }
+
+    if (this.budget.tryAllocate()) {
+      const pending = this.startNow(agentId, config).finally(() => { this.starting.delete(agentId); this.budget.release(); });
+      this.starting.set(agentId, pending);
+      return pending;
+    }
+
+    // Memory pressure → queue
+    this.startQueue.push({ agentId, config, enqueuedAt: Date.now() });
+    this.budget.queueLength = this.startQueue.length;
+    this.send({ type: "agent:status", agentId, status: "queued" });
+    this.send({ type: "agent:activity", agentId, activity: "offline", detail: "queued" });
+    this.log.info("queued (memory pressure)", { agentId });
   }
 
   private async startNow(agentId: string, config: AgentConfig): Promise<void> {
@@ -160,8 +271,15 @@ export class AgentManager {
       await writeFile(mem, seedMemory(config.displayName || config.name, config.description));
     }
 
+    const personalityFile = path.join(dir, "personality.md");
+    let personality: string | null | undefined;
+    try { personality = await readFile(personalityFile, "utf8"); if (!personality.trim()) personality = undefined; }
+    catch { personality = undefined; }
+
+    const effectiveDescription = personality ?? config.description;
+
     const systemPrompt = buildSystemPrompt({
-      name: config.name, displayName: config.displayName, description: config.description,
+      name: config.name, displayName: config.displayName, description: effectiveDescription,
       agentId, serverId: config.serverId, hostname: os.hostname(), os: `${os.platform()} ${os.arch()}`, workspace: dir,
     });
     const env: NodeJS.ProcessEnv = {
@@ -171,7 +289,7 @@ export class AgentManager {
     };
     delete env.CLAUDECODE; delete env.CLAUDE_CODE_ENTRYPOINT;
 
-    const running: Running = { session: undefined as unknown as RuntimeSession, config, sessionId: config.sessionId ?? null };
+    const running: Running = { session: undefined as unknown as RuntimeSession, config, sessionId: config.sessionId ?? null, pid: 0 };
     const cb: RuntimeCallbacks = {
       onSession: (sid) => { running.sessionId = sid; this.send({ type: "agent:session", agentId, sessionId: sid }); },
       onActivity: (activity, detail) => {
@@ -184,6 +302,7 @@ export class AgentManager {
         this.log.info("agent exited", { agentId, code });
         if (!this.agents.has(agentId)) return; // intentional stop/sleep/reset already called teardown (removed from map) — they sent their own status, don't overwrite
         this.agents.delete(agentId);
+        this.tryDequeue();
         // Process died on its own (not intentionally stopped): keep status=sleeping (session preserved, @ can --resume to recover);
         // Non-zero exit code (crash/signal kill) → activity=error to surface the failure; clean exit → sleeping.
         const crashed = code !== 0;
@@ -209,6 +328,7 @@ export class AgentManager {
       cwd: dir, model: config.model, runtimeConfig: config.runtimeConfig, sessionId: config.sessionId, systemPrompt, env,
       initialPrompt: useOneShotWakeNudge ? ONE_SHOT_WAKE_NUDGE : (config.sessionId ? RESUME_NUDGE : STARTUP_NUDGE),
     }, cb);
+    running.pid = running.session.pid ?? 0;
 
     this.send({ type: "agent:status", agentId, status: "active" });
     this.send({ type: "agent:activity", agentId, activity: "working", detail: "starting" });
