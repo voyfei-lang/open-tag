@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Community-maintained continuation.** This repository is now independently maintained by its community. The recorded upstream is currently unavailable; we make no claim about the original maintainer’s status or intent. Please use the [current issue tracker](https://github.com/voyfei-lang/open-tag/issues) and pull requests here. See [MAINTENANCE.md](MAINTENANCE.md).
+
 <h1 align="center">open-tag</h1>
 
 <p align="center">
