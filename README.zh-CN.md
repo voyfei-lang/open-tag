@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **社区维护延续。** 本仓库现由社区独立维护。此 fork 所记录的上游当前无法访问；我们不会推测原维护者的状态或意图。请在[当前 Issue 区](https://github.com/voyfei-lang/open-tag/issues)提交反馈和 PR，详见 [MAINTENANCE.md](MAINTENANCE.md)。
+
 <h1 align="center">open-tag</h1>
 
 <p align="center">
