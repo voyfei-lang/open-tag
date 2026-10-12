@@ -1,9 +1,11 @@
 // Auto-extracted from the former routes-api.ts monolith — bodies are verbatim.
 import type { ServerCtx } from "./ctx.js";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { db, schema } from "../../db/index.js";
 import { requireCap } from "../capabilities.js";
-import { DESC_TOO_LONG, INVALID_AGENT_NAME, addChannelMembers, descTooLong, invalidAgentName, dequeueAgent, resetAgent, startAgent, stopAgent, syncAgentProfile } from "../core.js";
+import { parseAgentInputPolicyPatch } from "../agentInputPolicy.js";
+import { canonicalDmParticipantIds, classifyAgentDm } from "../channelAccess.js";
+import { DESC_TOO_LONG, INVALID_AGENT_NAME, addChannelMembers, descTooLong, invalidAgentName, normalizeAgentHandle, dequeueAgent, resetAgent, startAgent, stopAgent, syncAgentProfile } from "../core.js";
 import { PROJECT_DIRECTORY_CAPABILITY, projectDirectoryBlockReason, requestDaemon, requestDaemonByMachine } from "../daemonHub.js";
 import { publish } from "../realtime.js";
 import { ALL_SCOPE_KEYS, SCOPES, effectiveScopes, isScopeLiteral } from "../scopes.js";
@@ -44,8 +46,9 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
   if (p === "/api/agents" && method === "POST") {
     if (!await requireCap(serverId, userId, "manageAgents")) return (sendErr(res, 403, "need manageAgents capability"), true);
     const b = await readJson(req);
-    if (!b.name) return (sendErr(res, 400, "name required"), true);
-    if (invalidAgentName(b.name)) return (sendErr(res, 400, INVALID_AGENT_NAME), true);
+    if (typeof b.name !== "string" || !b.name.trim()) return (sendErr(res, 400, "name required"), true);
+    const name = normalizeAgentHandle(b.name);
+    if (invalidAgentName(name)) return (sendErr(res, 400, INVALID_AGENT_NAME), true);
     if (descTooLong(b.description)) return (sendErr(res, 400, DESC_TOO_LONG), true);
     // A new agent must be created bound to a machine — an unbound (machineId=null) agent can only run via the
     // legacy broadcastToDaemons fallback (any daemon connected to the server may pick it up), which is a
@@ -63,12 +66,12 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
     // race-proof (no SELECT-then-INSERT gap): a duplicate live name inserts no row → friendly 409. Soft-deleted
     // names are excluded by the index predicate, so a deleted agent's name can be reused.
     const [agent] = await db.insert(schema.agents).values({
-      serverId, name: b.name, displayName: b.displayName || b.name, description: b.description ?? null,
+      serverId, name, displayName: b.displayName || name, description: b.description ?? null,
       model: b.model || null, runtime: b.runtime || "claude", machineId: b.machineId, projectPath: resolvedProject.projectPath,
       runtimeConfig: { provider: b.provider ?? "default", model: b.model ?? null, reasoningEffort: b.reasoning ?? null, mode: b.fastMode ? "fast" : "default" },
       envVars: b.envVars ?? {}, executionMode: b.fastMode ? "fast" : "auto", creatorType: "user", creatorId: userId,
     }).onConflictDoNothing({ target: [schema.agents.serverId, schema.agents.name], where: isNull(schema.agents.deletedAt) }).returning();
-    if (!agent) return (sendErr(res, 409, `an agent named "${b.name}" already exists`), true);
+    if (!agent) return (sendErr(res, 409, `an agent named "${name}" already exists`), true);
     const all = (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.name, "all"))))[0];
     // Join #all at the channel watermark, NOT lastReadSeq=0 — a newly created agent must not have its first
     // `message check` flooded with the channel's entire pre-existing history (it only needs messages from now on).
@@ -81,7 +84,9 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
   const am = /^\/api\/agents\/([^/]+)$/.exec(p);
   if (am && !isUuid(am[1]!)) return (sendErr(res, 404, "agent not found"), true); // covers GET/PATCH/DELETE — non-uuid would throw casting into the uuid column
   if (am && method === "GET") {
-    const a = (await db.select().from(schema.agents).where(and(eq(schema.agents.id, am[1]!), eq(schema.agents.serverId, serverId))))[0];
+    const a = (await db.select().from(schema.agents).where(and(
+      eq(schema.agents.id, am[1]!), eq(schema.agents.serverId, serverId), isNull(schema.agents.deletedAt),
+    )))[0];
     if (!a) return (sendErr(res, 404, "agent not found"), true);
     const canManage = await requireCap(serverId, userId, "manageAgents");
     return (sendJson(res, 200, {
@@ -91,14 +96,29 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
       creatorType: a.creatorType, creatorId: a.creatorId, createdAt: a.createdAt,
       projectBound: Boolean(a.projectPath),
       projectPath: canManage ? a.projectPath : null,
+      ...(canManage ? { incomingMode: a.incomingMode, commandWhitelist: a.commandWhitelist } : {}),
     }), true);
   }
   if (am && method === "PATCH") {
     if (!await requireCap(serverId, userId, "manageAgents")) return (sendErr(res, 403, "need manageAgents capability"), true);
-    const b = await readJson(req); const patch: Record<string, unknown> = {};
+    const b = await readJson(req);
+    if (!b || typeof b !== "object" || Array.isArray(b)) return (sendErr(res, 400, "invalid request body"), true);
+    const patch: Record<string, unknown> = {};
     if (descTooLong(b.description)) return (sendErr(res, 400, DESC_TOO_LONG), true);
     const current = (await db.select().from(schema.agents).where(and(eq(schema.agents.id, am[1]!), eq(schema.agents.serverId, serverId), isNull(schema.agents.deletedAt))))[0];
     if (!current) return (sendErr(res, 404, "agent not found"), true);
+    const policy = parseAgentInputPolicyPatch(b);
+    if ("error" in policy) return (sendErr(res, 400, policy.error), true);
+    if (policy.patch.commandWhitelist !== undefined) {
+      const ids = policy.patch.commandWhitelist;
+      const listed = ids.length ? await db.select({ id: schema.agents.id, creatorType: schema.agents.creatorType })
+        .from(schema.agents)
+        .where(and(eq(schema.agents.serverId, serverId), isNull(schema.agents.deletedAt), inArray(schema.agents.id, ids))) : [];
+      if (ids.includes(current.id) || listed.length !== ids.length || listed.some((agent) => agent.creatorType === "system")) {
+        return (sendErr(res, 400, "commandWhitelist contains unavailable agents"), true);
+      }
+    }
+    Object.assign(patch, policy.patch);
     for (const k of ["displayName", "description", "model", "runtime", "avatarUrl"]) if (b[k] !== undefined) patch[k] = b[k];
     if (b.envVars !== undefined) patch.envVars = b.envVars;
     let projectPathChanged = false;
@@ -119,7 +139,13 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
     if (patch.displayName !== undefined || patch.description !== undefined) {
       await syncAgentProfile(serverId, am[1]!, updated.displayName, updated.description);
     }
-    return (sendJson(res, 200, { ok: true, projectPath: updated.projectPath, sessionCleared: projectPathChanged }), true);
+    return (sendJson(res, 200, {
+      ok: true,
+      projectPath: updated.projectPath,
+      sessionCleared: projectPathChanged,
+      incomingMode: updated.incomingMode,
+      commandWhitelist: updated.commandWhitelist,
+    }), true);
   }
   if (am && method === "DELETE") {
     if (!await requireCap(serverId, userId, "manageAgents")) return (sendErr(res, 403, "need manageAgents capability"), true);
@@ -271,7 +297,7 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
     const a = (await db.select().from(schema.agents).where(and(eq(schema.agents.id, agId), eq(schema.agents.serverId, serverId))))[0];
     if (!a) return (sendErr(res, 404, "agent not found"), true);
     if (a.projectPath) return (sendErr(res, 409, "project-local skills are read-only; manage them in the bound project"), true);
-    const wsName = ({ claude: ".claude", codex: ".codex", copilot: ".copilot", hermes: ".hermes", kimi: ".skills", opencode: ".opencode", cursor: ".cursor", pi: ".pi" } as Record<string, string>)[a.runtime] || ".claude";
+    const wsName = ({ claude: ".claude", codex: ".codex", copilot: ".copilot", hermes: ".hermes", kimi: ".skills", opencode: ".opencode", cursor: ".cursor", pi: ".pi", reasonix: ".reasonix" } as Record<string, string>)[a.runtime] || ".claude";
     const relPath = `${wsName}${a.runtime === "kimi" ? "" : "/skills"}/${skillName}/SKILL.md`;
     if (method === "PUT") {
       const b = await readJson(req);
@@ -291,22 +317,27 @@ export async function handleAgents(ctx: ServerCtx): Promise<boolean> {
   const adms = /^\/api\/agents\/([^/]+)\/agent-dms$/.exec(p);
   if (adms && !isUuid(adms[1]!)) return (sendErr(res, 404, "agent not found"), true);
   if (adms && method === "GET") {
+    if (!await requireCap(serverId, userId, "manageAgents")) return (sendErr(res, 403, "need manageAgents capability"), true);
     const agId = adms[1]!;
     // serverId scope: confirm the agent belongs to this tenant before fanning out over its memberships
     // (the inner channel query already filters by serverId, but pre-checking 404s a foreign agent id and
     // avoids a cross-tenant channel_members scan). Mirrors the workspace-files / scopes ownership pre-check.
-    const own = (await db.select({ id: schema.agents.id }).from(schema.agents).where(and(eq(schema.agents.id, agId), eq(schema.agents.serverId, serverId))))[0];
+    const own = (await db.select({ id: schema.agents.id }).from(schema.agents).where(and(eq(schema.agents.id, agId), eq(schema.agents.serverId, serverId), isNull(schema.agents.deletedAt))))[0];
     if (!own) return (sendErr(res, 404, "agent not found"), true);
     const mine = await db.select().from(schema.channelMembers).where(and(eq(schema.channelMembers.memberType, "agent"), eq(schema.channelMembers.memberId, agId)));
     const out: any[] = [];
     for (const cm of mine) {
-      const ch = (await db.select().from(schema.channels).where(and(eq(schema.channels.id, cm.channelId), eq(schema.channels.type, "dm"), eq(schema.channels.serverId, serverId))))[0]; // serverId scope: don't surface another tenant's DM channels for this agent id
-      if (!ch) continue;
-      const peers = (await db.select().from(schema.channelMembers).where(eq(schema.channelMembers.channelId, ch.id))).filter((m) => !(m.memberType === "agent" && m.memberId === agId));
-      const peer = peers.find((m) => m.memberType === "agent"); // only include agent↔agent DMs
-      if (!peer) continue;
-      const pa = (await db.select().from(schema.agents).where(eq(schema.agents.id, peer.memberId)))[0];
-      out.push({ id: ch.id, name: pa?.name ?? "agent", peerId: peer.memberId, peerType: "agent", lastMessageAt: ch.lastMessageAt });
+      const ch = (await db.select().from(schema.channels).where(and(eq(schema.channels.id, cm.channelId), eq(schema.channels.serverId, serverId))))[0];
+      if (!ch || ch.deletedAt || ch.type !== "dm" || ch.parentMessageId) continue;
+      const pair = canonicalDmParticipantIds(ch.name);
+      if (!pair || !pair.includes(agId)) continue;
+      const members = await db.select().from(schema.channelMembers).where(eq(schema.channelMembers.channelId, ch.id));
+      const agents = await db.select().from(schema.agents).where(inArray(schema.agents.id, pair));
+      const users = await db.select({ id: schema.users.id }).from(schema.users).where(inArray(schema.users.id, pair));
+      if (classifyAgentDm(serverId, ch.name, members, agents, users) !== "valid") continue;
+      const peerId = pair.find((id) => id !== agId)!;
+      const peer = agents.find((agent) => agent.id === peerId)!;
+      out.push({ id: ch.id, name: peer.name, peerId, peerType: "agent", lastMessageAt: ch.lastMessageAt });
     }
     return (sendJson(res, 200, out), true);
   }

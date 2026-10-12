@@ -69,10 +69,12 @@ export const agents = pgTable("agents", {
   activity: text("activity").default("offline").notNull(),// offline|online|thinking|working
   sessionId: text("session_id"),                  // current runtime session (used with --resume)
   model: text("model"),                            // model alias or NULL → CLI uses its local default (~/.claude / ~/.codex)
-  runtime: text("runtime").default("claude").notNull(),   // claude | codex | copilot | opencode | kimi | pi | cursor | hermes (registry: src/daemon/runtimes.ts REG)
+  runtime: text("runtime").default("claude").notNull(),   // claude | codex | copilot | opencode | kimi | pi | cursor | hermes | reasonix (registry: src/daemon/runtimes.ts REG)
   projectPath: text("project_path"),               // canonical absolute cwd on machineId; null = use isolated agent state dir
   runtimeConfig: jsonb("runtime_config").$type<Record<string, unknown>>().default({}).notNull(),
   executionMode: text("execution_mode").default("auto").notNull(),
+  incomingMode: text("incoming_mode").default("open").notNull(), // open | sealed
+  commandWhitelist: jsonb("command_whitelist").$type<string[]>().default([]).notNull(),
 
   envVars: jsonb("env_vars").$type<Record<string, string>>().default({}).notNull(),
   agentTokenHash: text("agent_token_hash"),       // hash of sk_agent_* token (used for CLI auth)
@@ -249,6 +251,7 @@ export const agentMessageDecisions = pgTable("agent_message_decisions", {
   // Durable transport admission is separate from reply/publication state. A partial fan-out retry
   // must never send work again to a recipient whose daemon already accepted this Turn.
   deliveryAdmittedAt: timestamp("delivery_admitted_at", { withTimezone: true }),
+  deliveryAdmissionToken: uuid("delivery_admission_token"), // non-null until the final daemon ACK; fences stale NACK/disconnect cleanup
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (t) => ({

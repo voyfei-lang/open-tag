@@ -3,9 +3,10 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { io, type Socket } from "socket.io-client";
 import { messageUnreadDelta, threadUnreadDelta } from "./threadUnread";
 import { initialAuthState, TOKEN_KEY, type AuthState } from "./routing.ts";
+import { createUnreadRefresh, type UnreadRefresh } from "./unreadRefresh";
 
 export interface Channel { id: string; name: string; description?: string; type: string; joined?: boolean; lastMessageAt?: string; archivedAt?: string | null }
-export interface Dm { id: string; name: string; type: string; description?: string; lastMessageAt?: string; peerId?: string | null; peerName?: string | null; peerDisplayName?: string | null; peerType?: string | null; peerAvatarUrl?: string | null }
+export interface Dm { id: string; name: string; type: string; description?: string; lastMessageAt?: string; audit?: boolean; peerId?: string | null; peerName?: string | null; peerDisplayName?: string | null; peerType?: string | null; peerAvatarUrl?: string | null }
 export interface Agent { id: string; name: string; displayName: string; description?: string; status: string; activity?: string; activityDetail?: string; model?: string; runtime: string; machineId?: string; projectBound?: boolean; projectPath?: string | null; avatarUrl?: string | null; creatorType?: string }
 export interface Machine { id: string; name?: string; hostname?: string; os?: string; runtimes?: string[]; status?: string; daemonVersion?: string; isComputer?: boolean; apiKeyPrefix?: string }
 export interface Human { userId: string; name: string; displayName?: string; role?: string; description?: string; avatarUrl?: string | null }
@@ -52,9 +53,23 @@ interface Store {
   agentPanelReq: string | null;                                   // pending open-agent-panel request (agent id); null when none
   clearAgentPanelReq: () => void;                                 // clear the pending request after the Chat view has consumed it
   savedIds: Set<string>;                                          // saved message ids known in this session (bookmark state + Saved count source)
-  saveMsg: (messageId: string) => Promise<void>;
-  unsaveMsg: (messageId: string) => Promise<void>;
+  saveMsg: (messageId: string) => Promise<SavedMutationResult>;
+  unsaveMsg: (messageId: string) => Promise<SavedMutationResult>;
   listSaved: (limit?: number, offset?: number) => Promise<{ saved: any[]; hasMore: boolean }>;
+}
+type SavedMutationResult = "updated" | "failed" | "ignored";
+export function shareSavedMutation(
+  mutations: Map<string, Promise<SavedMutationResult>>,
+  key: string,
+  run: () => Promise<SavedMutationResult>,
+): Promise<SavedMutationResult> {
+  const pending = mutations.get(key);
+  if (pending) return pending;
+  const mutation = run().finally(() => {
+    if (mutations.get(key) === mutation) mutations.delete(key);
+  });
+  mutations.set(key, mutation);
+  return mutation;
 }
 const Ctx = createContext<Store>(null as any);
 export const useStore = () => useContext(Ctx);
@@ -81,6 +96,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [latestDaemonVersion, setLatestDaemonVersion] = useState(""); // newest published daemon version from the machines endpoint; "" until first load (→ raises no outdated alert)
   const [humans, setHumans] = useState<Human[]>([]);
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
+  const savedMutationsRef = useRef(new Map<string, Promise<SavedMutationResult>>());
   const [agentPanelReq, setAgentPanelReq] = useState<string | null>(null); // cross-component signal: LiveAgentBar (sidebar) → Chat view opens the agent profile panel
   const [activeId, setActiveId] = useState(""); // id of the workspace to activate; changing it drives the activation effect (initial pick + every client-side switch)
   const tokenRef = useRef("");
@@ -89,6 +105,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const meIdRef = useRef<string | undefined>(undefined); // current user id; read by socket handlers (own-message unread suppression) and stable across workspace switches
   const sockRef = useRef<Socket | null>(null); // active socket connection; emits join:channel when joining/creating a channel mid-session for room isolation
   const subscribedRef = useRef<Set<string>>(new Set()); // channels/threads explicitly subscribed by the active view; re-emitted on every (re)connect so a reconnect re-joins them
+  const unreadRefreshRef = useRef<UnreadRefresh | null>(null);
   const listeners = useRef(new Set<(e: Ev) => void>());
 
   const api = async (method: string, path: string, body?: unknown) => {
@@ -103,10 +120,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // turns false, so this (now-stale) reload's results are dropped instead of landing mixed with the new
     // workspace's data — guards rapid A→B→C switches (the sequential awaits below each read the shared sidRef).
     const sid = sidRef.current;
+    const unreadRefresh = unreadRefreshRef.current;
     const fresh = () => sidRef.current === sid;
     const ch = await api("GET", "/api/channels"); if (fresh()) setChannels(ch);
     try { const dm = await api("GET", "/api/channels/dm"); if (fresh()) setDms(dm); } catch { if (fresh()) setDms([]); }
-    try { const un = (await api("GET", "/api/channels/unread")) || {}; if (fresh()) setUnread(un); } catch { if (fresh()) setUnread({}); }
+    await unreadRefresh?.request();
     const ag = await api("GET", "/api/agents"); if (fresh()) setAgents(ag);
     try { const mc = await api("GET", `/api/servers/${sid}/machines`); if (fresh()) { setMachines(mc.machines || []); setLatestDaemonVersion(mc.latestDaemonVersion || ""); } } catch { if (fresh()) setMachines([]); }
     try { const hm = await api("GET", `/api/servers/${sid}/members`); if (fresh()) setHumans(hm); } catch { if (fresh()) setHumans([]); }
@@ -139,14 +157,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const openDM = async (memberType: string, memberId: string) => { const body = memberType === "user" ? { userId: memberId } : { agentId: memberId }; const r = await api("POST", "/api/channels/dm", body); if (r?.id) { await reload(); sockRef.current?.emit("join:channel", r.id); } return r?.id ?? null; };
   const joinChannel = async (id: string) => { await api("POST", `/api/channels/${id}/join`); await reload(); sockRef.current?.emit("join:channel", id); };
   const leaveChannel = async (id: string) => { await api("POST", `/api/channels/${id}/leave`); await reload(); };
-  // A channel's badge = its own-timeline unread + its followed threads' unread. Reading a container (channel OR
-  // thread) clears only that container's portion; the server returns the affected sidebar channel's authoritative
-  // remaining (a thread read rolls onto its parent). We set the badge to that exact value instead of blind-zeroing
-  // it — blind-zeroing hid still-unopened thread replies, which then "resurrected" on the next unread refetch.
+  // A channel's badge = its own-timeline unread + its followed threads' unread. A successful read confirms that
+  // server state changed, then refreshes the full badge map so overlapping channel/thread reads cannot apply
+  // per-response counts out of order. Keep the captured activation owner: late responses from an old workspace
+  // must not schedule work on the newly active workspace.
   const markRead = (id: string) => {
+    const unreadRefresh = unreadRefreshRef.current;
     api("POST", `/api/channels/${id}/read`, {}).then((r) => {
-      const key = r?.channelId; if (!key) return;
-      setUnread((u) => { const n = { ...u }; if (Number(r.unread) > 0) n[key] = Number(r.unread); else delete n[key]; return n; });
+      if (r?.ok !== true || typeof r?.channelId !== "string") return;
+      if (unreadRefresh && unreadRefreshRef.current === unreadRefresh) void unreadRefresh.request();
     }).catch(() => {});
   };
   const uploadFiles = async (channelId: string, files: FileList | File[]) => {
@@ -193,9 +212,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const openThread = async (parentChannelId: string, parentMessageId: string) => { const r = await api("POST", `/api/channels/${parentChannelId}/threads`, { parentMessageId }); return r?.threadChannelId ?? null; };
   const openAgentPanel = (agentId: string) => setAgentPanelReq(agentId); // LiveAgentBar → Chat: open the agent profile panel (Activity tab); Chat consumes & clears
   const clearAgentPanelReq = () => setAgentPanelReq(null);
-  // Saved messages: private bookmarks, optimistically update savedIds.
-  const saveMsg = async (messageId: string) => { setSavedIds((s) => new Set(s).add(messageId)); await api("POST", "/api/channels/saved", { messageId }); };
-  const unsaveMsg = async (messageId: string) => { setSavedIds((s) => { const n = new Set(s); n.delete(messageId); return n; }); await api("DELETE", `/api/channels/saved/${messageId}`); };
+  // Saved messages: commit confirmed mutations only to the workspace that initiated them.
+  const mutateSaved = (messageId: string, nextSaved: boolean): Promise<SavedMutationResult> => {
+    const sid = sidRef.current;
+    const key = `${sid}:${messageId}`;
+    return shareSavedMutation(savedMutationsRef.current, key, async () => {
+      try {
+        const r = await api(nextSaved ? "POST" : "DELETE", nextSaved ? "/api/channels/saved" : `/api/channels/saved/${messageId}`, nextSaved ? { messageId } : undefined);
+        if (sidRef.current !== sid) return "ignored";
+        if (r?.ok !== true) return "failed";
+        setSavedIds((s) => { const n = new Set(s); if (nextSaved) n.add(messageId); else n.delete(messageId); return n; });
+        return "updated";
+      } catch { return sidRef.current === sid ? "failed" : "ignored"; }
+    });
+  };
+  const saveMsg = (messageId: string) => mutateSaved(messageId, true);
+  const unsaveMsg = (messageId: string) => mutateSaved(messageId, false);
   const listSaved = async (limit = 20, offset = 0) => { const r = await api("GET", `/api/channels/saved?limit=${limit}&offset=${offset}`); return { saved: r?.saved ?? [], hasMore: !!r?.hasMore }; };
 
   // ── Auth bootstrap (runs once): resolve a session token + the user's workspace list, then pick the initial workspace
@@ -251,11 +283,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // switch) before the socket connects, the flag ensures the late connection is closed immediately.
     let cancelled = false;
     const dispatch = (d: Ev) => listeners.current.forEach((cb) => cb(d));
-    // Unread badge correction: optimistic ++ gives instant feedback; after each incoming message a debounced
-    // re-fetch of /channels/unread overwrites store.unread with the DB truth, fixing badge drift caused by
-    // cross-view messages or reconnect catch-up double-counting.
-    let unreadTimer: ReturnType<typeof setTimeout> | null = null;
-    const syncUnread = () => { if (unreadTimer) clearTimeout(unreadTimer); unreadTimer = setTimeout(async () => { try { setUnread((await api("GET", "/api/channels/unread")) || {}); } catch { /* keep stale value on error */ } }, 400); };
     const myId = meIdRef.current;
     // Point at the active workspace + clear the previous one's state so a switch starts from a clean slate; the
     // ready=false → workspace skeleton shows while it reloads.
@@ -263,6 +290,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     sidRef.current = cur.id; setServerId(cur.id); setSlug(cur.slug || "open-tag"); setMyRole(cur.role || "member"); setCapabilities(cur.capabilities || {});
     setServerAvatar(cur.avatarUrl ? `${cur.avatarUrl}?token=${encodeURIComponent(tokenRef.current)}` : null);
     setChannels([]); setDms([]); setUnread({}); setAgents([]); setMachines([]); setHumans([]); setSavedIds(new Set()); setAgentPanelReq(null);
+    const unreadRefresh = createUnreadRefresh(
+      () => api("GET", "/api/channels/unread"),
+      (values) => setUnread(values),
+    );
+    unreadRefreshRef.current?.dispose();
+    unreadRefreshRef.current = unreadRefresh;
+    // Schedule one fixed-delay server refresh for a burst of realtime events. Do not move the timer forward on
+    // every event: a steady stream must not starve badge convergence. The coordinator adds one trailing load when
+    // another event arrives during an in-flight request.
+    let unreadTimer: ReturnType<typeof setTimeout> | null = null;
+    const syncUnread = () => {
+      if (unreadTimer) return;
+      unreadTimer = setTimeout(() => {
+        unreadTimer = null;
+        void unreadRefresh.request();
+      }, 400);
+    };
     subscribedRef.current = new Set(); // the previous workspace's view-subscriptions don't carry over
     sockRef.current = null; // the previous socket is closed by this effect's cleanup; drop the stale ref until the new one connects
     let lastSeq = 0;
@@ -288,19 +332,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         try {
           const r = await api("GET", `/api/messages/sync?since=${lastSeq}`);
           for (const msg of (r?.messages || [])) {
-            if (msg.senderId !== myId && msg.channelId) setUnread((u) => ({ ...u, [msg.channelId]: (u[msg.channelId] || 0) + 1 }));
             dispatch({ type: "message", channelId: msg.channelId, message: msg });
           }
-          syncUnread(); // correct badge after catch-up (prevent double-count inflation)
           if (r?.maxSeq) lastSeq = Math.max(lastSeq, r.maxSeq);
         } catch { /* */ }
       });
+      // The server emits this only after its asynchronous membership lookup and room joins finish. Refreshing here
+      // closes the initial/reconnect gap even when message catch-up fails or samples before room delivery is ready.
+      sock.on("rooms:joined", syncUnread);
       sock.on("message:new", (msg: any) => {
         if (msg?.seq) lastSeq = Math.max(lastSeq, msg.seq);
         if (msg?.channelId) {
           // Own messages don't increment unread; thread-channel messages are aggregated by thread:updated onto their parent channel.
           const delta = messageUnreadDelta(msg.senderId, myId, msg.channelType);
-          if (delta > 0) { setUnread((u) => ({ ...u, [msg.channelId]: (u[msg.channelId] || 0) + delta })); syncUnread(); } // optimistic ++ for instant feedback; debounced re-fetch corrects stale counts
+          if (delta > 0) syncUnread();
           setChannels((cs) => cs.map((c) => (c.id === msg.channelId ? { ...c, lastMessageAt: msg.createdAt } : c)));
           setDms((ds) => ds.map((d) => (d.id === msg.channelId ? { ...d, lastMessageAt: msg.createdAt } : d)));
         }
@@ -334,11 +379,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       sock.on("message:updated", (m: any) => dispatch({ type: "message:updated", message: m }));
       sock.on("thread:updated", (p: any) => {
         const delta = threadUnreadDelta(1, p?.senderId, myId);
-        if (p?.parentChannelId && delta > 0) { setUnread((u) => ({ ...u, [p.parentChannelId]: (u[p.parentChannelId] || 0) + delta })); syncUnread(); }
+        if (p?.parentChannelId && delta > 0) syncUnread();
         dispatch({ type: "thread:updated", ...p });
       });
     })();
-    return () => { cancelled = true; sock?.close(); sockRef.current = null; if (unreadTimer) clearTimeout(unreadTimer); };
+    return () => {
+      cancelled = true;
+      sock?.close();
+      sockRef.current = null;
+      if (unreadTimer) clearTimeout(unreadTimer);
+      unreadRefresh.dispose();
+      if (unreadRefreshRef.current === unreadRefresh) unreadRefreshRef.current = null;
+    };
   }, [activeId]);
 
   // Showcase demo agents (creatorType="system") stay in `agents` so #showcase history still resolves their

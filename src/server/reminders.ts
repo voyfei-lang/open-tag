@@ -1,6 +1,6 @@
 // Reminder scheduler (reminders are author-owned, persistent, observable, re-schedulable wake signals).
 // A tick scans due reminders → posts a system reminder in the anchor channel (@author → @mention wakes the author agent) → marks one-shot done / reschedules recurring.
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, isNull, lte } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { createMessage } from "./core.js";
 import { createLogger } from "../log.js";
@@ -20,10 +20,10 @@ export function startReminderScheduler(): void {
 
 async function tick(): Promise<void> {
   const due = await db.select().from(schema.reminders).where(and(eq(schema.reminders.status, "scheduled"), lte(schema.reminders.remindAt, new Date())));
-  for (const r of due) await fire(r).catch((e) => log.warn("fire failed", { id: r.id, detail: String(e?.message ?? e) }));
+  for (const r of due) await fireReminder(r).catch((e) => log.warn("fire failed", { id: r.id, detail: String(e?.message ?? e) }));
 }
 
-async function fire(r: typeof schema.reminders.$inferSelect): Promise<void> {
+export async function fireReminder(r: typeof schema.reminders.$inferSelect): Promise<void> {
   const now = new Date();
   const sec = r.recurrence ? Number(r.recurrence) : 0;
   // Atomic claim: grab reminders that are "due and still scheduled" in one shot (recurring → push to next, stays scheduled; one-shot → mark fired).
@@ -35,10 +35,12 @@ async function fire(r: typeof schema.reminders.$inferSelect): Promise<void> {
     .where(and(eq(schema.reminders.id, r.id), eq(schema.reminders.status, "scheduled"), lte(schema.reminders.remindAt, now)))
     .returning();
   if (!won.length) return; // already claimed by another tick/instance
-  const owner = r.ownerType === "agent"
-    ? (await db.select().from(schema.agents).where(eq(schema.agents.id, r.ownerId)))[0]
-    : (await db.select().from(schema.users).where(eq(schema.users.id, r.ownerId)))[0];
-  const ownerName = (owner as { name?: string } | undefined)?.name;
+  const ownerRows = r.ownerType === "agent"
+    ? await db.select().from(schema.agents).where(and(eq(schema.agents.id, r.ownerId), isNull(schema.agents.deletedAt)))
+    : await db.select().from(schema.users).where(eq(schema.users.id, r.ownerId));
+  const owner = (ownerRows as Array<{ name?: string }>)[0];
+  const ownerName = owner?.name;
+  if (!owner) return;
   // Anchor channel: the anchor message's channel > reminder.channelId > #all
   let channelId = r.channelId ?? null;
   if (r.anchorMessageId) {
@@ -52,7 +54,7 @@ async function fire(r: typeof schema.reminders.$inferSelect): Promise<void> {
   if (!channelId) return; // already atomically claimed above; if there's nowhere to deliver, just end (don't re-update status)
   // system reminder, @author (@mention wakes the author agent; if the author is human it's just a visible reminder)
   const mention = ownerName ? `@${ownerName} ` : "";
-  await createMessage({ serverId: r.serverId, channelId, senderType: "system", senderId: null, senderName: "reminder", content: `⏰ ${mention}reminder: ${r.content}` });
+  await createMessage({ serverId: r.serverId, channelId, senderType: "system", senderId: r.ownerId, senderName: "reminder", content: `⏰ ${mention}reminder: ${r.content}` });
   log.info("reminder fired", { id: r.id, owner: ownerName, recurring: sec > 0 });
   // the status transition (fired / reschedule) was done in the atomic claim above; no repeat update here
 }

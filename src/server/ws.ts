@@ -13,9 +13,10 @@ import { markMachineAgentsOffline } from "./machineLiveness.js";
 import { ACTIVITY_LOG_CAP, logActivity, pruneAgentActivityLog, startAgentActivityRun } from "./agentActivity.js";
 import { finalizeAgentActivityRun } from "./core.js";
 import { acceptAgentDeliveryAck, hasPendingAgentDelivery, noteAgentDeliveryPending, rejectAgentDeliveryAck } from "./agentDeliveryAck.js";
-import { commitAgentDeliveryAdmission, releaseAgentDeliveryAdmission, type CommittedAgentDelivery } from "./agentDeliveryAdmission.js";
+import { acknowledgeAgentDeliveryAdmission, commitAgentDeliveryAdmission, ownsAgentDeliveryAdmission, releaseAgentDeliveryAdmission, type CommittedAgentDelivery } from "./agentDeliveryAdmission.js";
 import { createWsFrameGate } from "./wsFrameGate.js";
 import { handleConversationTurnDaemonTopologyChange, resumeConversationTurnsForMachine } from "./conversationTurnRecovery.js";
+import { scheduleConversationTurn } from "./conversationTurns.js";
 
 export { ACTIVITY_LOG_CAP, logActivity, pruneAgentActivityLog } from "./agentActivity.js";
 
@@ -81,34 +82,53 @@ async function onDaemon(ws: WebSocket, key: string): Promise<void> {
         if (!hasPendingAgentDelivery(deliveryId)) {
           ws.send(JSON.stringify({ type: "agent:deliver:rejected", deliveryId, error: "delivery is not pending" }));
         } else {
-          const result = await commitAgentDeliveryAdmission({ ws, serverId: serverId!, machineId, deliveryId, agentId: msg.agentId, seq: msg.seq });
-          if (result.ok) {
-            committedDeliveries.set(result.delivery.deliveryId, result.delivery);
-            ws.send(JSON.stringify({ type: "agent:deliver:admitted", deliveryId: result.delivery.deliveryId }));
+          const existing = deliveryId ? committedDeliveries.get(deliveryId) : undefined;
+          const existingMatches = existing
+            && existing.agentId === msg.agentId
+            && existing.seq === msg.seq
+            && !!machineId
+            && isCurrentMachineConn(machineId, ws);
+          if (existing && !existingMatches) {
+            ws.send(JSON.stringify({ type: "agent:deliver:rejected", deliveryId, error: "delivery identity changed" }));
+          } else if (existing && await ownsAgentDeliveryAdmission(existing)) {
+            ws.send(JSON.stringify({ type: "agent:deliver:admitted", deliveryId: existing.deliveryId }));
           } else {
-            ws.send(JSON.stringify({ type: "agent:deliver:rejected", deliveryId, error: result.error }));
+            if (existing) committedDeliveries.delete(existing.deliveryId);
+            const result = await commitAgentDeliveryAdmission({ ws, serverId: serverId!, machineId, deliveryId, agentId: msg.agentId, seq: msg.seq });
+            if (result.ok) {
+              committedDeliveries.set(result.delivery.deliveryId, result.delivery);
+              ws.send(JSON.stringify({ type: "agent:deliver:admitted", deliveryId: result.delivery.deliveryId }));
+            } else {
+              ws.send(JSON.stringify({ type: "agent:deliver:rejected", deliveryId, error: result.error }));
+            }
           }
         }
       }
       else if (msg.type === "agent:deliver:ack") {
         const delivery = typeof msg.deliveryId === "string" ? committedDeliveries.get(msg.deliveryId) : undefined;
         if (delivery && delivery.agentId === msg.agentId && delivery.seq === msg.seq) {
-          committedDeliveries.delete(delivery.deliveryId);
-          acceptAgentDeliveryAck(delivery.deliveryId, delivery.agentId, delivery.seq);
+          const acknowledged = await acknowledgeAgentDeliveryAdmission(delivery);
+          if (acknowledged.accepted) {
+            committedDeliveries.delete(delivery.deliveryId);
+            acceptAgentDeliveryAck(delivery.deliveryId, delivery.agentId, delivery.seq);
+            if (acknowledged.resumeTurnId) scheduleConversationTurn(acknowledged.resumeTurnId, new Date());
+          } else {
+            committedDeliveries.delete(delivery.deliveryId);
+          }
         }
       }
       else if (msg.type === "agent:deliver:nack") {
         const delivery = typeof msg.deliveryId === "string" ? committedDeliveries.get(msg.deliveryId) : undefined;
         if (delivery && delivery.agentId === msg.agentId && delivery.seq === msg.seq) {
+          const released = await releaseAgentDeliveryAdmission(delivery);
           committedDeliveries.delete(delivery.deliveryId);
-          await releaseAgentDeliveryAdmission(delivery);
-          rejectAgentDeliveryAck(delivery.deliveryId, delivery.agentId, delivery.seq, typeof msg.error === "string" ? msg.error : undefined);
+          if (released) rejectAgentDeliveryAck(delivery.deliveryId, delivery.agentId, delivery.seq, typeof msg.error === "string" ? msg.error : undefined);
         }
       }
       else if (msg.type === "agent:session" && msg.agentId) { await db.update(schema.agents).set({ sessionId: msg.sessionId }).where(eq(schema.agents.id, msg.agentId)); await publish(serverId!, { type: "agent:session", agentId: msg.agentId, sessionId: msg.sessionId }); } // forward to the frontend
       else if (msg.type === "agent:trajectory" && msg.agentId) {
         const a = (await db.select().from(schema.agents).where(eq(schema.agents.id, msg.agentId)))[0];
-        await publish(serverId!, { type: "trajectory", agentId: msg.agentId, name: a?.name, entries: msg.entries ?? [] });
+        await publish(serverId!, { type: "trajectory", agentId: msg.agentId, channelId: msg.channelId, name: a?.name, entries: msg.entries ?? [] });
         const entries = [];
         for (const e of msg.entries ?? []) {
           const item = await logActivity(serverId!, msg.agentId, e, { channelId: msg.channelId, streamId: msg.streamId, runSeq: e.runSeq });
@@ -211,7 +231,7 @@ async function onAgentUpdate(serverId: string, msg: any): Promise<void> {
   if (msg.type === "agent:activity") patch.activity = msg.activity;
   await db.update(schema.agents).set(patch).where(eq(schema.agents.id, msg.agentId));
   const a = (await db.select().from(schema.agents).where(eq(schema.agents.id, msg.agentId)))[0];
-  if (a) await publish(serverId, { type: "agent", id: a.id, name: a.name, status: a.status, activity: a.activity, detail: msg.detail ?? "" });
+  if (a) await publish(serverId, { type: "agent", id: a.id, name: a.name, status: a.status, activity: a.activity, channelId: msg.channelId, detail: msg.detail ?? "" });
   if (msg.type === "agent:activity") {
     const item = await logActivity(serverId, msg.agentId, { kind: "status", activity: msg.activity, detail: msg.detail, runSeq: msg.runSeq }, { channelId: msg.channelId, streamId: msg.streamId, runSeq: msg.runSeq });
     if (item && msg.channelId && msg.streamId) await publish(serverId, { type: "agent:reply", agentId: msg.agentId, channelId: msg.channelId, streamId: msg.streamId, name: a?.displayName ?? a?.name, op: "activity", entries: [item] });

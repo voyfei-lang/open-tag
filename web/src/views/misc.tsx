@@ -12,6 +12,8 @@ import { ConnectComputerWizard } from "./ConnectComputerWizard.tsx";
 import { useConfirm, useEscClose } from "../ConfirmModal.tsx";
 import { useTranslation } from "react-i18next";
 import { daemonUpdateCommandTemplate, isDaemonUpdateAvailable } from "../machineUi.ts";
+import { copyText } from "../lib/clipboard.ts";
+import { useToast } from "../toast.tsx";
 
 export function Tasks() {
   const { channels, slug } = useStore();
@@ -182,7 +184,7 @@ export function Inbox() {
 }
 
 // Runtime name → display label mapping
-const RT_LABEL: Record<string, string> = { claude: "Claude Code", codex: "Codex CLI", opencode: "OpenCode", copilot: "Copilot CLI", cursor: "Cursor CLI", gemini: "Gemini CLI", kimi: "Kimi", hermes: "Hermes" };
+const RT_LABEL: Record<string, string> = { claude: "Claude Code", codex: "Codex CLI", opencode: "OpenCode", copilot: "Copilot CLI", cursor: "Cursor CLI", gemini: "Gemini CLI", kimi: "Kimi", hermes: "Hermes", reasonix: "Reasonix" };
 export function Computers() {
   const { machines, agents, slug, api, serverId, reload, attachmentUrl, capabilities, latestDaemonVersion } = useStore();
   const confirm = useConfirm();
@@ -278,7 +280,10 @@ function DaemonUpdateModal({ onClose, machine }: { onClose: () => void; machine:
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const cmd = daemonUpdateCommandTemplate(window.location.origin);
-  const copy = () => { navigator.clipboard?.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); };
+  const copy = async () => {
+    if (!await copyText(cmd)) { window.prompt(t("misc.connectModalCopyBtn"), cmd); return; }
+    setCopied(true); setTimeout(() => setCopied(false), 1500);
+  };
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -315,8 +320,14 @@ export function Search() {
   useEffect(() => {
     const v = q.trim();
     if (!v) { setResults([]); setSearched(false); return; }
-    const h = setTimeout(async () => { const d = await api("GET", `/api/messages/search?q=${encodeURIComponent(v)}`); setResults(d?.results || []); setSearched(true); }, 300);
-    return () => clearTimeout(h);
+    let cancelled = false;
+    const h = setTimeout(async () => {
+      const d = await api("GET", `/api/messages/search?q=${encodeURIComponent(v)}`);
+      if (cancelled) return;
+      setResults(d?.results || []);
+      setSearched(true);
+    }, 300);
+    return () => { cancelled = true; clearTimeout(h); };
   }, [q]);
   return (
     <>
@@ -473,10 +484,12 @@ export function Saved() {
   const { slug, listSaved, unsaveMsg } = useStore();
   const nav = useNavigate();
   const { t } = useTranslation();
+  const toast = useToast();
   const PAGE = 20;
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(false);
+  const unsavingRef = useRef(new Set<string>());
   // Paginate by DB-row offset, NOT items.length: listSaved now filters out saved rows whose channel the
   // caller can't currently read (IDOR-B5 read-time gate), so the visible count is ≤ the rows the server
   // consumed. Deriving the next offset from items.length would re-request overlapping windows (duplicate
@@ -489,7 +502,18 @@ export function Saved() {
   }).finally(() => setLoading(false));
   useEffect(() => { load(0); /* eslint-disable-next-line */ }, []);
   const open = (it: any) => nav(`/s/${slug}/channel/${it.channelId}?msg=${it.messageId}`);
-  const unsave = (e: React.MouseEvent, it: any) => { e.stopPropagation(); unsaveMsg(it.messageId); setItems((p) => p.filter((x) => x.messageId !== it.messageId)); setNextOffset((n) => Math.max(0, n - 1)); };
+  const unsave = async (e: React.MouseEvent, it: any) => {
+    e.stopPropagation();
+    if (unsavingRef.current.has(it.messageId)) return;
+    unsavingRef.current.add(it.messageId);
+    try {
+      const result = await unsaveMsg(it.messageId);
+      if (result === "failed") { toast.error(t("common.savedUpdateFailed")); return; }
+      if (result === "ignored") return;
+      setItems((p) => p.filter((x) => x.messageId !== it.messageId));
+      setNextOffset((n) => Math.max(0, n - 1));
+    } finally { unsavingRef.current.delete(it.messageId); }
+  };
   const source = (it: any) => it.channelType === "thread"
     ? <><MessageCircle size={12} /> {t("misc.savedThread")}{it.parentChannelType === "dm" ? "@" : "#"}{it.parentChannelName ?? "?"}</>
     : it.channelType === "private"
@@ -522,36 +546,6 @@ export function Saved() {
 }
 
 // Invite members (join-links): owner/admin generates invite links (configurable role/max-uses) → share → recipient registers or logs in to join.
-export async function copyText(text: string): Promise<boolean> {
-  if (navigator.clipboard && window.isSecureContext) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      // Fall back to the textarea path below.
-    }
-  }
-
-  const el = document.createElement("textarea");
-  el.value = text;
-  el.setAttribute("readonly", "");
-  el.style.position = "fixed";
-  el.style.top = "-1000px";
-  el.style.left = "-1000px";
-  el.style.opacity = "0";
-  document.body.appendChild(el);
-  el.focus();
-  el.select();
-  el.setSelectionRange(0, text.length);
-  try {
-    return document.execCommand("copy");
-  } catch {
-    return false;
-  } finally {
-    document.body.removeChild(el);
-  }
-}
-
 function InvitesSettings({ api, serverId }: { api: any; serverId: string }) {
   const { capabilities } = useStore();
   const { t } = useTranslation();

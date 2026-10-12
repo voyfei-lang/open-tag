@@ -10,7 +10,7 @@ import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
-import { copyText } from "./views/misc.tsx";
+import { copyText } from "./lib/clipboard.ts";
 
 const alertTypes = new Set(["note", "tip", "important", "warning", "caution"]);
 
@@ -40,6 +40,7 @@ export type NameItem = { name?: string; id?: string };
 type MentionItem = { type?: string; id?: string; name?: string };
 export type Nav = (type: string, args: string[]) => void;
 const lc = (x?: string) => (x ?? "").toLowerCase();
+const mentionKey = (x?: string) => (x ?? "").normalize("NFC").toLowerCase();
 
 function textFromReact(node: ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
@@ -99,6 +100,7 @@ export function CodeBlock({ children }: { children: ReactNode }) {
       window.setTimeout(() => setCopied(false), 1200);
     } else {
       setCopied(false);
+      window.prompt(t("md.copyCode"), text);
     }
   };
   return (
@@ -169,11 +171,11 @@ export function processMessageContent(raw: string, ctx: { mentions: MentionItem[
     .replace(/`[^`\n]+`/g, (m) => `\u0000C${codes.push(m) - 1}\u0000`);          // inline code placeholder
   const refs: string[] = [];
   const ref = (markdownLink: string) => `\u0000R${refs.push(markdownLink) - 1}\u0000`;
-  const mMap = new Map(ctx.mentions.map((x) => [lc(x.name), x]));
+  const mMap = new Map(ctx.mentions.map((x) => [mentionKey(x.name), x]));
   const cMap = new Map(ctx.channels.map((c) => [lc(c.name), c]));
   s = s
     .replace(/#([\p{L}\p{N}_-]+):([\da-f]{6,8})/giu, (m, name: string, short: string) => { const c = cMap.get(lc(name)); return c ? ref(`[#${name}:${short}](tag:thread:${c.id}:${short})`) : m; })  // thread reference first (prevent #channel from consuming it)
-    .replace(/@([\p{L}\p{N}_-]+)/gu, (m, name: string) => { const mn = mMap.get(lc(name)); return mn ? ref(`[@${name}](tag:${mn.type === "agent" ? "agent" : "human"}:${mn.id})`) : m; })  // only @ the server actually recorded as a mention
+    .replace(/@([\p{L}\p{M}\p{N}_-]+)/gu, (m, name: string) => { const mn = mMap.get(mentionKey(name)); return mn ? ref(`[@${name}](tag:${mn.type === "agent" ? "agent" : "human"}:${mn.id})`) : m; })  // only @ the server actually recorded as a mention
     .replace(/(^|[^\w/])(?:task\s+)#([1-9]\d*)\b/giu, (_m, pre: string, num: string) => `${pre}${ref(`[task #${num}](tag:task:${num})`)}`)  // only "task #N" (bare #N not rendered yet: no knownTaskNumbers whitelist, avoids false positives)
     .replace(/#([\p{L}\p{N}_-]+)/gu, (m, name: string) => { const c = cMap.get(lc(name)); return c ? ref(`[#${name}](tag:channel:${c.id})`) : m; });
   return s

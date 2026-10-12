@@ -82,6 +82,56 @@ gap: task *ownership* (§6 C5).
 
 ## 4. The four invariants (越权红线 — every endpoint must obey)
 
+### Agent input-source settings
+
+An agent can use `incomingMode="sealed"` to reject raw input from other agents unless their live,
+same-workspace agent IDs appear in its `commandWhitelist`. Human and system input remains trusted, and
+an agent may still read its own messages. Only members with `manageAgents` may read or change these
+settings. Updates accept at most 100 unique agent UUIDs, exclude the target itself and system showcase
+agents, and reject missing, deleted, or cross-workspace entries without revealing which entry failed.
+For agent-authored direct mentions and DMs, the server applies the target's policy before reserving any
+reply decision, owner, grant, or wake responsibility. Human-authored Turns keep their existing routing.
+In a public channel, the same check runs before mention auto-join writes membership or mention rows, so a
+rejected agent source cannot pull a sealed non-member into the channel. Human mention auto-join is unchanged.
+Agent task assignment checks the target before resolving or mutating the requested task and returns 403 for
+an unlisted source. The shared task core repeats the check to keep non-route callers fail-closed across races.
+`message/check` applies the protected input view after Turn admission classification but before creating any
+observation or ambient reply decision. Its contiguous cursor still advances across rejected stable rows so
+opening a policy later does not replay old input that was intentionally skipped.
+`message/read` applies the same view after bounded history selection, including before/after/around windows,
+so rejected text never enters the rendered message list while pagination remains bounded by stored sequence.
+The send-time freshness check filters its admitted snapshot before deciding whether to hold a draft. Rejected
+agent input neither appears in the hold response nor blocks an otherwise valid send.
+The shared agent-plane message-id resolver applies both channel access and the target's input view. Rejected
+rows therefore cannot be used as reaction, reply, claim, update, assignment, or unclaim targets by ID.
+`message/resolve` uses that shared resolver for both full and short IDs and returns the same existence-hiding
+404 for rejected input that it returns for missing or channel-inaccessible messages.
+Agent search over-fetches a bounded candidate set, applies the protected input view, and returns at most 20
+allowed rows. Agent-attributed system audits cannot reintroduce a rejected source's matching task text.
+Task listing applies the input view to task rows before serialization. Removing a source from the whitelist
+therefore prevents its task title from re-entering the target's context through the task projection.
+Task claim by channel and number resolves the full task through the same view before any ownership mutation.
+Thread parent resolution applies the input view after channel access. A rejected parent returns 404 for both
+thread read and reply, even when the target remains a member of the previously created task thread.
+When the parent is allowed, thread read applies the same view independently to its bounded reply list. A
+rejected reply cannot enter context through an otherwise trusted human-owned thread.
+Agent server discovery keeps a rejected peer's stable handle and platform status but replaces its editable
+description with `null`, so roster discovery does not become a text-input bypass.
+Direct profile lookup follows the same rule and also falls back from the rejected peer's editable display
+name to its stable handle; runtime, model, and platform status remain discoverable.
+Channel-member listings likewise replace a rejected agent's editable display name with its stable handle
+while leaving trusted human labels and accepted agent labels unchanged.
+Legacy system-message delivery resolves every non-null actor against workspace human membership, treats all
+other actor IDs as agent sources, and applies the protected view before creating recipient work or waking a
+daemon. An actor-attributed system message may still wake its own agent when explicitly addressed.
+Fired reminders persist their owner ID on the system message, so an agent-authored reminder cannot launder
+its content through the trusted platform-source path; human-owned reminders remain trusted.
+Reconnect backlog scans carry sender type and actor identity through the same protected view before waking
+an agent. Agent-attributed system rows cannot regain ambient system wake semantics during reconnect.
+When a primary owner releases coordination, every better-fit candidate that rejects that owner is atomically
+denied with its summary cleared before promotion continues. A rejected request cannot remain pending and
+block settlement merely because another eligible candidate was promoted.
+
 1. **Planes never cross.** Human JWT, agent token, daemon key are not interchangeable. Using the wrong
    plane's credential on a route is a defect.
 2. **Tenant isolation by derived `serverId`.** Every server-scoped query MUST constrain by the `serverId`
@@ -92,12 +142,40 @@ gap: task *ownership* (§6 C5).
 3. **Capability/scope pass ≠ resource access.** Passing the role/scope gate is necessary, not sufficient.
    A second check must confirm the subject may touch *this specific resource*: channel membership for
    reads/writes, ownership for tasks/attachments, `manageX` for privileged management.
-4. **Channel visibility is invite-only for private/DM — for humans *and* agents.** Public channels: any
-   member of the server may read/join. Private / DM / thread: only explicitly-added members. The human
+4. **Channel visibility is invite-only for private/DM — for humans *and* agents, apart from the narrow
+   manager oversight rule below.** Public channels: any member of the server may read/join. Private /
+   DM / thread: only explicitly-added members receive ordinary access. The human
    self-join guard (`routes-api.ts` "private channel is invite-only") has an agent-plane equivalent:
    `canAgentReadChannel` enforced in `resolveTarget` / `resolveMessageId` / `findParent` / `channel/join`
    (§6 C1–C3/C6/C7/C8 — fixed). Human REST read/write of messages and tasks is gated by
-   `canUserReadChannel` (`channelAccess.ts`) — same logic, human plane (§6 F-REST — fixed).
+   `canUserReadChannel` (`channelAccess.ts`) — same logic, human plane (§6 F-REST — fixed). Threads
+   inherit the current parent-channel decision before any direct thread membership is considered, and
+   tenant ownership is checked before membership rows can grant access. Message creation, reactions,
+   action-card execution, all task mutations, and thread creation or follow-state changes use the
+   separate `canUserWriteChannel` boundary.
+   Channel-scoped attachment uploads use that same write boundary. Because multipart parsing streams
+   objects before the channel field can be authorized, a rejected upload removes every parsed object
+   before returning an error and creates no attachment rows.
+   Direct-message identity is the canonical `dm:<sorted UUID>:<sorted UUID>` pair. An agent-to-agent
+   conversation is valid only while both identities are live agents in the same workspace and its
+   membership rows contain exactly that agent pair; malformed or stale rows fail closed.
+   **Oversight exception:** a human holding `manageAgents` may read a valid agent-to-agent DM and its
+   existing threads. The exception applies only to `canUserReadChannel`; the write boundary continues
+   to require ordinary participant access. Human direct messages remain member-private. Agent-profile
+   conversation history uses the same capability and canonical-validity checks. Thread metadata queries
+   bind every requested parent message to the already-authorized root channel.
+   Privileged channel-management routes identify the same valid root through
+   `isAgentDmAuditChannel`, including inherited thread targets. Membership, join, lifecycle, and
+   thread follow-state mutations refuse those conversations even when the caller can manage channels.
+   Reconnect sync derives audited roots and threads from current access instead of creating membership rows.
+   Soft-deleting either participant immediately invalidates the pair and revokes root, thread, list, and
+   event-delivery access.
+   **Deleted-channel notice exception:** agent message check may expose only a system message whose tagged
+   metadata names that exact deleted channel and includes the authenticated agent in the deletion-time
+   recipient snapshot. The one-shot observation claim is tenant-scoped and does not restore membership,
+   grant reply authority, or expose any other deleted-channel history.
+   The web agent-profile DM tab is rendered only for `manageAgents` holders, and direct URL state falls
+   back to the ordinary profile for other members.
 
 ## 5. What the hardening PRs enforced
 
@@ -135,6 +213,7 @@ gap: task *ownership* (§6 C5).
 | `PUT /api/agents/:id/scopes` | member only | `manageAgents` (GET stays member-readable) |
 | `POST` / `DELETE /api/channels/:id/members` | member only (private-invite bypass + cross-tenant) | `manageChannels` + channel-ownership pre-check |
 | `resolveAgent` (all `/agent-api/*`) | accepted soft-deleted agents | filters `isNull(deletedAt)`; soft-delete also clears `agentTokenHash` |
+| `GET /agent-api/profile/show?handle=` human fallback | any global username | target must belong to the current workspace |
 
 `POST /api/servers/:id/machines/:id/reconnect` was already correctly gated (`manageMachines` + online-guard).
 

@@ -18,6 +18,13 @@ import { startFailReasonKey } from "../startFailReason.ts";
 import { CodeBlock, ColorSwatch, GithubAlertBlockquote, colorValueFromTag, markdownSchema, markdownUrlTransform, remarkColorSwatches, remarkGithubAlerts, remarkHtmlAsText } from "../messageRender.tsx";
 import i18n from "../i18n";
 import { ProjectDirectoryField } from "./ProjectDirectoryPicker.tsx";
+import { copyText } from "../lib/clipboard.ts";
+import { isCurrentAgentProfileResponse } from "../lib/agentProfileLoad.ts";
+import {
+  filterAvailableAgentIds,
+  MAX_AGENT_INPUT_SOURCES,
+  toggleAgentInputSource,
+} from "../lib/agentInputPolicy.ts";
 
 // Unified agent status label: fine-grained activity (working/thinking/online) takes priority;
 // offline/absent falls back to lifecycle status (active/sleeping/inactive).
@@ -64,7 +71,7 @@ export function Members() {
         </div>
       </aside>
       <main className="content-col">
-        {userId ? <HumanProfile uid={userId} /> : agentId ? <AgentProfile id={agentId} onDeleted={() => nav(`/s/${slug}/agent`)} /> : <Roster agents={agents} humans={humans} onCreate={() => setModal(true)} canCreate={!!capabilities.manageAgents} />}
+        {userId ? <HumanProfile uid={userId} /> : agentId ? <AgentProfile key={agentId} id={agentId} onDeleted={() => nav(`/s/${slug}/agent`)} /> : <Roster agents={agents} humans={humans} onCreate={() => setModal(true)} canCreate={!!capabilities.manageAgents} />}
       </main>
       {modal && <CreateAgentModal onClose={() => setModal(false)} />}
       {inviteModal && <InviteHumanModal onClose={() => setInviteModal(false)} />}
@@ -85,7 +92,10 @@ function InviteHumanModal({ onClose }: { onClose: () => void }) {
     if (!l) l = await api("POST", `/api/servers/${serverId}/join-links`, { role: "member", maxUses: null });
     if (l?.token) setLink(`${location.origin}/join/${l.token}`);
   })(); /* eslint-disable-next-line */ }, [serverId]);
-  const copy = async () => { try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* */ } };
+  const copy = async () => {
+    if (!await copyText(link)) { window.prompt(t("members.copyLink"), link); return; }
+    setCopied(true); setTimeout(() => setCopied(false), 1500);
+  };
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -148,20 +158,38 @@ function Roster({ agents, humans, onCreate, canCreate }: { agents: any[]; humans
 
 export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string; onDeleted: () => void; onClose?: () => void; onMessage?: () => void }) {
   const { t } = useTranslation();
-  const { api, machines, reload, onEvent, capabilities, openDM, slug, uploadAgentAvatar, attachmentUrl } = useStore();
+  const { api, machines, visibleAgents, reload, onEvent, capabilities, openDM, slug, uploadAgentAvatar, attachmentUrl } = useStore();
   const confirm = useConfirm();
   const toast = useToast();
   const nav = useNavigate();
   const [sp, setSp] = useSearchParams();
-  const tab = sp.get("agentTab") || "profile";
+  const requestedTab = sp.get("agentTab") || "profile";
+  const tab = requestedTab === "dms" && !capabilities.manageAgents ? "profile" : requestedTab;
   const [a, setA] = useState<any>(null);
   const [edit, setEdit] = useState(false); const [dn, setDn] = useState(""); const [ds, setDs] = useState(""); const [projectPath, setProjectPath] = useState(""); // profile edit state
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [showRestart, setShowRestart] = useState(false);
   const [avBusy, setAvBusy] = useState(false); const [avErr, setAvErr] = useState(""); const [signedAvatar, setSignedAvatar] = useState<string | null>(null);
   const [perContent, setPerContent] = useState<string | null>(null); const [perBusy, setPerBusy] = useState(false);
-  const refetch = async () => { const data = await api("GET", "/api/agents/" + id); setA(data); setSignedAvatar(resolveAvatar(data?.avatarUrl, attachmentUrl)); };
-  useEffect(() => { refetch(); }, [id]);
+  const profileLoadVersionRef = useRef(0);
+  const activeProfileIdRef = useRef(id);
+  activeProfileIdRef.current = id;
+  const refetch = async () => {
+    const requestedId = id;
+    const requestVersion = ++profileLoadVersionRef.current;
+    const data = await api("GET", "/api/agents/" + requestedId);
+    if (!isCurrentAgentProfileResponse(
+      requestedId, requestVersion, activeProfileIdRef.current, profileLoadVersionRef.current, data,
+    )) return;
+    setA(data);
+    setSignedAvatar(resolveAvatar((data as any).avatarUrl, attachmentUrl));
+  };
+  useEffect(() => {
+    setA(null);
+    setSignedAvatar(null);
+    void refetch();
+    return () => { profileLoadVersionRef.current++; };
+  }, [id]);
   useEffect(() => onEvent((e) => { if (e.type === "agent" && e.id === id) setA((p: any) => (p ? { ...p, status: e.status ?? p.status, activity: e.activity ?? p.activity } : p)); }), [id]);
   const onPickAvatar = async (f: File) => { setAvBusy(true); setAvErr(""); try { const url = await uploadAgentAvatar(id, f); setSignedAvatar(url); await refetch(); await reload(); } catch (err: any) { setAvErr(String(err?.message || err)); } finally { setAvBusy(false); } };
   const onPickSeed = async (scheme: string) => { setAvBusy(true); setAvErr(""); try { await api("PATCH", "/api/agents/" + id, { avatarUrl: scheme }); await refetch(); await reload(); } catch (err: any) { setAvErr(String(err?.message || err)); } finally { setAvBusy(false); } };
@@ -171,7 +199,7 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
   // branched on the body — the catch only sees network-level failures.
   const uploadPersonality = async (f: File) => { setPerBusy(true); try { const text = await f.text(); const r = await api("PUT", `/api/agents/${id}/personality`, { content: text }); if (r?.error) { toast.error(t("members.personalitySaveFailed", { error: r.error })); return; } toast.info(t("members.personalitySaved")); await fetchPersonality(); } catch (e: any) { toast.error(String(e?.message || e)); } finally { setPerBusy(false); } };
   const deletePersonality = async () => { if (!(await confirm({ title: t("members.personalityDeleteTitle"), message: t("members.personalityDeleteMessage"), confirmLabel: t("members.delete"), danger: true }))) return; setPerBusy(true); try { const r = await api("DELETE", `/api/agents/${id}/personality`); if (r?.error) { toast.error(t("members.personalityDeleteFailed", { error: r.error })); return; } toast.info(t("members.personalityDeleted")); setPerContent(null); } catch (e: any) { toast.error(String(e?.message || e)); } finally { setPerBusy(false); } };
-  if (!a) return <div className="scroll"><div className="empty">{t("members.loading")}</div></div>;
+  if (!a || a.id !== id) return <div className="scroll"><div className="empty">{t("members.loading")}</div></div>;
   // Surface the server's concrete 503 reason ("no daemon online" / "runtime X unavailable on selected machine" …);
   // the generic machine-may-be-offline guess alone made users blind-retry (live 2026-07-05: 3× restart → 503).
   // Known reasons render localized (startFailReasonKey); unknown ones fall back to the raw server string.
@@ -190,6 +218,10 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
     else r = await api("POST", `/api/agents/${id}/reset`, { wipeWorkspace: true, restart: true });
     if (r?.error) startFail(r); // lifecycle RPCs settle before return; a failed reset/stop returns 503 and aborts the restart phase
     setTimeout(refetch, 500);
+  };
+  const clearSession = async () => {
+    if (!(await confirm({ title: t("members.clearSessionTitle", { name: a.displayName || a.name }), message: t("members.resetDesc"), confirmLabel: t("members.clearSession"), danger: true }))) return;
+    await doRestart("reset");
   };
   const del = async () => { if (!(await confirm({ title: t("members.deleteAgentTitle", { name: a.name }), message: t("members.deleteAgentMessage"), confirmLabel: t("members.delete"), danger: true }))) return; await api("DELETE", "/api/agents/" + id); await reload(); onDeleted(); };
   const startEdit = () => { setDn(a.displayName || a.name); setDs(a.description || ""); setProjectPath(a.projectPath || ""); setProjectPickerOpen(false); setEdit(true); };
@@ -210,6 +242,7 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
         <button className="joinbtn" onClick={() => ctl(a.status === "active" ? "stop" : "start")}>{a.status === "active" ? t("members.stop") : t("members.start")}</button>
         {a.status === "queued" && <button className="joinbtn" style={{ color: "var(--status-orange)" }} onClick={() => api("POST", `/api/agents/${id}/dequeue`).then(() => setTimeout(refetch, 300)).catch(() => {})}>✕</button>}
         <button className="joinbtn" onClick={() => setShowRestart(true)}>{t("members.restart")}</button>
+        <button className="joinbtn" onClick={clearSession}>{t("members.clearSession")}</button>
         <button className="joinbtn" style={{ color: "var(--error)" }} onClick={del}>{t("members.delete")}</button>
       </>}
     </div>
@@ -234,13 +267,13 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
           ["workspace", t("members.tabWorkspace")],
           ["integrations", t("members.tabIntegrations")],
           ["activity", t("members.tabActivity")],
-        ] as [string, string][]).map(([k, label]) => (
+        ] as [string, string][]).filter(([k]) => k !== "dms" || capabilities.manageAgents).map(([k, label]) => (
           <button key={k} className={tab === k ? "on" : ""} onClick={() => setSp((prev) => { const n = new URLSearchParams(prev); n.set("agentTab", k); return n; })}>{label}</button>
         ))}
       </div>
       {tab === "workspace" ? <WorkspaceTab id={id} />
         : tab === "activity" ? <ActivityTab id={id} name={a.name} />
-        : tab === "permissions" ? <PermissionsTab id={id} />
+        : tab === "permissions" ? <PermissionsTab key={id} id={id} />
         : tab === "integrations" ? <AppsTab id={id} />
         : tab === "dms" ? <DmsTab id={id} name={a.name} />
         : tab === "reminders" ? <RemindersTab id={id} name={a.name} />
@@ -271,6 +304,12 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
                 </div>}
               </>)}
             </div>
+            {capabilities.manageAgents && a.creatorType !== "system" && <AgentInputPolicyCard
+              key={id}
+              agent={a}
+              candidates={visibleAgents.filter((candidate) => candidate.id !== id)}
+              onSaved={(policy) => setA((current: any) => current ? { ...current, ...policy } : current)}
+            />}
             <div className="card">
               <h3>{t("members.personalityTitle")} <small className="meta">{perContent ? "(personality.md)" : ""}</small></h3>
               {perContent ? <div className="meta" style={{ whiteSpace: "pre-wrap", maxHeight: 200, overflow: "auto", marginBottom: 8 }}>{perContent}</div> : <div className="meta" style={{ opacity: .6 }}>{t("members.personalityEmpty")}</div>}
@@ -284,6 +323,97 @@ export function AgentProfile({ id, onDeleted, onClose, onMessage }: { id: string
         )}
       {showRestart && <RestartModal name={a.displayName || a.name} onClose={() => setShowRestart(false)} onPick={doRestart} />}
     </>
+  );
+}
+
+function AgentInputPolicyCard({
+  agent,
+  candidates,
+  onSaved,
+}: {
+  agent: any;
+  candidates: any[];
+  onSaved: (policy: { incomingMode: "open" | "sealed"; commandWhitelist: string[] }) => void;
+}) {
+  const { t } = useTranslation();
+  const { api } = useStore();
+  const toast = useToast();
+  const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+  const [mode, setMode] = useState<"open" | "sealed">(agent.incomingMode === "open" ? "open" : "sealed");
+  const [whitelist, setWhitelist] = useState<Set<string>>(() => new Set(filterAvailableAgentIds(
+    Array.isArray(agent.commandWhitelist)
+      ? agent.commandWhitelist.filter((id: unknown): id is string => typeof id === "string")
+      : [],
+    candidateIds,
+  )));
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const activeWhitelist = filterAvailableAgentIds(whitelist, candidateIds);
+  const whitelistFull = activeWhitelist.length >= MAX_AGENT_INPUT_SOURCES;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  const toggleAgent = (id: string) => setWhitelist((current) => toggleAgentInputSource(
+    filterAvailableAgentIds(current, candidateIds),
+    id,
+  ));
+  const save = async () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    const submittedMode = mode;
+    const submittedWhitelist = filterAvailableAgentIds(whitelist, candidateIds);
+    try {
+      const result = await api("PATCH", `/api/agents/${agent.id}`, {
+        incomingMode: submittedMode,
+        commandWhitelist: submittedWhitelist,
+      });
+      if (!mountedRef.current) return;
+      const validMode = result?.incomingMode === "open" || result?.incomingMode === "sealed";
+      const validWhitelist = Array.isArray(result?.commandWhitelist)
+        && result.commandWhitelist.every((id: unknown) => typeof id === "string");
+      if (result?.error || result?.ok !== true || !validMode || !validWhitelist) throw new Error("invalid input policy response");
+      const policy = {
+        incomingMode: result.incomingMode as "open" | "sealed",
+        commandWhitelist: result.commandWhitelist as string[],
+      };
+      setMode(policy.incomingMode);
+      setWhitelist(new Set(policy.commandWhitelist));
+      onSaved(policy);
+      toast.info(t("members.inputPolicySaved"));
+    } catch {
+      if (mountedRef.current) toast.error(t("members.inputPolicySaveFailed"));
+    } finally {
+      if (mountedRef.current) {
+        savingRef.current = false;
+        setSaving(false);
+      }
+    }
+  };
+  const sealed = mode === "sealed";
+  return (
+    <div className="card" data-agent-input-policy>
+      <h3>{t("members.inputPolicyTitle")}</h3>
+      <div className="meta" style={{ marginBottom: 8 }}>{t("members.inputPolicyDescription")}</div>
+      <label className="perm-row">
+        <input type="checkbox" checked={sealed} disabled={saving} onChange={(event) => setMode(event.target.checked ? "sealed" : "open")} />
+        <span className="grow"><span className="who">{t("members.inputPolicySealed")}</span><div className="meta">{t("members.inputPolicySealedDescription")}</div></span>
+      </label>
+      {sealed && <>
+        <div className="sec sec-sub">{t("members.inputPolicyWhitelist")}</div>
+        <div className="meta">{t("members.inputPolicyWhitelistLimit", { count: MAX_AGENT_INPUT_SOURCES })}</div>
+        {candidates.length === 0 ? <div className="meta">{t("members.inputPolicyWhitelistEmpty")}</div>
+          : candidates.map((candidate) => <label key={candidate.id} className="perm-row">
+              <input type="checkbox" checked={whitelist.has(candidate.id)} disabled={saving || (!whitelist.has(candidate.id) && whitelistFull)} onChange={() => toggleAgent(candidate.id)} />
+              <span className="grow"><span className="who">{candidate.displayName || candidate.name}</span> <span className="meta">@{candidate.name}</span></span>
+            </label>)}
+      </>}
+      <div className="perm-head" style={{ marginTop: 12 }}>
+        <button className="ok" disabled={saving} onClick={save}>{t("members.save")}</button>
+      </div>
+    </div>
   );
 }
 
@@ -359,22 +489,86 @@ function SkillsSection({ id, projectBound }: { id: string; projectBound: boolean
 // Permissions tab (GET/PUT /api/agents/:id/scopes — grouped scope checkboxes with enforcement)
 function PermissionsTab({ id }: { id: string }) {
   const { t } = useTranslation();
-  const { api } = useStore();
+  const { api, capabilities } = useStore();
+  const toast = useToast();
+  const canManage = !!capabilities.manageAgents;
   const [data, setData] = useState<any>(null);
   const [granted, setGranted] = useState<Set<string>>(new Set());
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [saved, setSaved] = useState(false);
-  useEffect(() => { (async () => { const d = await api("GET", `/api/agents/${id}/scopes`); setData(d); setGranted(new Set(d.granted || [])); })(); }, [id]);
-  if (!data) return <div className="scroll"><div className="empty">{t("members.loading")}</div></div>;
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setData(null);
+    setLoadFailed(false);
+    (async () => {
+      try {
+        const result = await api("GET", `/api/agents/${id}/scopes`);
+        const validCatalog = Array.isArray(result?.catalog) && result.catalog.every((scope: any) =>
+          typeof scope?.key === "string" && typeof scope?.group === "string"
+          && typeof scope?.label === "string" && typeof scope?.description === "string");
+        if (result?.error || result?.agentId !== id || (result?.mode !== "default" && result?.mode !== "custom")
+          || !Number.isInteger(result?.revision) || !Array.isArray(result?.granted)
+          || !result.granted.every((scope: unknown) => typeof scope === "string") || !validCatalog) {
+          throw new Error("invalid permission response");
+        }
+        if (cancelled) return;
+        setData(result);
+        setGranted(new Set(result.granted));
+      } catch {
+        if (!cancelled) setLoadFailed(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id, loadAttempt]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+  if (!data) return <div className="scroll"><div className="empty">{loadFailed
+    ? <>{t("members.permissionsLoadFailed")} <button type="button" className="joinbtn" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>{t("members.permissionsRetry")}</button></>
+    : t("members.loading")}</div></div>;
   const toggle = (k: string) => setGranted((g) => { const n = new Set(g); n.has(k) ? n.delete(k) : n.add(k); return n; });
-  const save = async (scopes: string[]) => { const d = await api("PUT", `/api/agents/${id}/scopes`, { scopes }); setData({ ...data, ...d }); setGranted(new Set(d.granted || [])); setSaved(true); setTimeout(() => setSaved(false), 1500); };
+  const save = async (scopes: string[]) => {
+    if (!canManage || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    if (savedTimerRef.current) { clearTimeout(savedTimerRef.current); savedTimerRef.current = null; }
+    setSaved(false);
+    try {
+      const result = await api("PUT", `/api/agents/${id}/scopes`, { scopes });
+      if (!mountedRef.current) return;
+      if (result?.error) throw new Error(result.error);
+      if (result?.agentId !== id || result?.mode !== "custom" || !Number.isInteger(result?.revision)
+        || !Array.isArray(result?.granted) || !result.granted.every((scope: unknown) => typeof scope === "string")) {
+        throw new Error("invalid permission response");
+      }
+      setData({ ...data, ...result }); setGranted(new Set(result.granted)); setSaved(true);
+      savedTimerRef.current = setTimeout(() => { setSaved(false); savedTimerRef.current = null; }, 1500);
+    } catch {
+      if (mountedRef.current) toast.error(t("members.permissionsSaveFailed"));
+    } finally {
+      if (mountedRef.current) {
+        savingRef.current = false;
+        setSaving(false);
+      }
+    }
+  };
   const groups: Record<string, any[]> = {};
   for (const s of data.catalog || []) (groups[s.group] ||= []).push(s);
   return (
     <div className="scroll">
       <div className="perm-head">
         <span className="meta">{data.mode === "custom" ? t("members.permCustom") : t("members.permDefault")} · rev {data.revision}</span>
-        <button className="joinbtn" onClick={() => save((data.catalog || []).map((s: any) => s.key))}>{t("members.grantAll")}</button>
-        <button className="ok" style={{ marginLeft: "auto" }} onClick={() => save([...granted])}>{t("members.save")}</button>
+        {canManage && <>
+          <button className="joinbtn" disabled={saving} onClick={() => save((data.catalog || []).map((s: any) => s.key))}>{t("members.grantAll")}</button>
+          <button className="ok" style={{ marginLeft: "auto" }} disabled={saving} onClick={() => save([...granted])}>{t("members.save")}</button>
+        </>}
         {saved && <span className="saved">{t("members.savedConfirm")}</span>}
       </div>
       {/* Scope group/label/description come from the server catalog (src/server/scopes.ts, English). Translate
@@ -385,7 +579,7 @@ function PermissionsTab({ id }: { id: string }) {
           <div className="sec sec-sub">{t(`members.scopeGroup.${g}`, { defaultValue: g })}</div>
           {list.map((s: any) => (
             <label key={s.key} className="perm-row">
-              <input type="checkbox" checked={granted.has(s.key)} onChange={() => toggle(s.key)} />
+              <input type="checkbox" checked={granted.has(s.key)} disabled={!canManage || saving} onChange={() => toggle(s.key)} />
               <span className="grow"><span className="who">{t(`members.scopeLabel.${s.key.replace(/:/g, "_")}`, { defaultValue: s.label })}</span> <code className="perm-key">{s.key}</code><div className="meta">{t(`members.scopeDesc.${s.key.replace(/:/g, "_")}`, { defaultValue: s.description })}</div></span>
             </label>
           ))}
@@ -416,9 +610,9 @@ function DmsTab({ id, name }: { id: string; name: string }) {
 
 // Reminders tab (read-only; agents create reminders via CLI, humans can only view)
 const REM_STATUS: Record<string, string> = {
-  scheduled: i18n.t("members.remScheduled"),
-  fired: i18n.t("members.remFired"),
-  cancelled: i18n.t("members.remCancelled"),
+  scheduled: "members.remScheduled",
+  fired: "members.remFired",
+  cancelled: "members.remCancelled",
 };
 function RemindersTab({ id, name }: { id: string; name: string }) {
   const { t } = useTranslation();
@@ -431,7 +625,7 @@ function RemindersTab({ id, name }: { id: string; name: string }) {
       : rem.map((r) => (
         <div className="card" key={r.id}>
           <div className="who">{r.content}{r.recurrence ? <span className="meta"> · {t("members.recurrenceEvery", { seconds: r.recurrence })}</span> : null}</div>
-          <div className="meta"><span className={"rem-badge " + (r.status || "scheduled")}>{REM_STATUS[r.status] || r.status}</span> · {fmtDateTime(r.remindAt)}</div>
+          <div className="meta"><span className={"rem-badge " + (r.status || "scheduled")}>{REM_STATUS[r.status] ? t(REM_STATUS[r.status]) : r.status}</span> · {fmtDateTime(r.remindAt)}</div>
         </div>
       ))}</div>;
 }
@@ -476,7 +670,10 @@ function WorkspaceTab({ id }: { id: string }) {
   useEffect(() => { setSel(null); setExpanded(new Set()); setRoot(`~/.open-tag/agents/${id}/`); (async () => { const d = await api("GET", `/api/agents/${id}/workspace-files`); if (d.error) { setErr(d.error); setFiles([]); } else { setErr(""); setFiles(d.files || []); if (d.root) setRoot(d.root.endsWith("/") ? d.root : d.root + "/"); } })(); }, [id]);
   const open = async (f: any) => { setMode("preview"); const d = await api("GET", `/api/agents/${id}/workspace-files/read?path=${encodeURIComponent(f.path)}`); setSel({ path: f.path, content: d.content, error: d.error }); };
   const toggleDir = (path: string) => setExpanded((s) => { const n = new Set(s); n.has(path) ? n.delete(path) : n.add(path); return n; });
-  const copyRoot = () => navigator.clipboard?.writeText(root).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+  const copyRoot = async () => {
+    if (!await copyText(root)) { window.prompt(t("members.copyPath"), root); return; }
+    setCopied(true); setTimeout(() => setCopied(false), 1500);
+  };
   // Collapse filter: a node is visible iff all its ancestor directories are expanded (top-level visible by default, subdirs collapsed)
   const visible = files.filter((f) => { const parts = f.path.split("/"); if (!showHidden && parts.some((seg: string) => seg.startsWith("."))) return false; for (let i = 1; i < parts.length; i++) if (!expanded.has(parts.slice(0, i).join("/"))) return false; return true; });
   const isMd = !!sel && /\.md$/i.test(sel.path);
@@ -556,9 +753,9 @@ export function CreateAgentModal({ onClose, prefill, onCreated }: { onClose: () 
   }, [runtime, machineId]);
   const create = async () => {
     if (!machineId) { setErr(t("members.machineRequired")); return; } // Computer is required: an unbound agent only runs via the legacy broadcast-to-all-daemons fallback (tech-debt I77) — force an explicit pick.
-    const nm = name.trim();
+    const nm = name.trim().normalize("NFC");
     if (!nm) { setErr(t("members.nameRequired")); return; }
-    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(nm) || nm.length > 64) { setErr(t("members.nameInvalid")); return; } // @mention handle must be machine-safe; keep regex + length 64 in sync with core.ts AGENT_NAME_RE / MAX_AGENT_NAME
+    if (!/^\p{L}[\p{L}\p{M}\p{N}_-]*$/u.test(nm) || [...nm].length > 64) { setErr(t("members.nameInvalid")); return; } // Unicode @handle grammar; keep regex + length 64 in sync with core.ts AGENT_NAME_RE / MAX_AGENT_NAME
     setBusy(true); setErr("");
     try {
       const r = await api("POST", "/api/agents", { machineId, name: nm, description: desc.trim() || null, projectPath: projectPath.trim() || null, runtime, model: model && model !== LOCAL_DEFAULT ? model : null, reasoning: thinkingLevels.length ? (reasoning || null) : null, fastMode: fast });
@@ -568,7 +765,7 @@ export function CreateAgentModal({ onClose, prefill, onCreated }: { onClose: () 
       onClose();
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
   };
-  const RUNTIMES = [{ value: "claude", label: "Claude Code" }, { value: "codex", label: "Codex" }, { value: "copilot", label: "Copilot CLI" }, { value: "opencode", label: "OpenCode" }, { value: "kimi", label: "Kimi Code" }, { value: "pi", label: "Pi" }, { value: "cursor", label: "Cursor" }, { value: "hermes", label: "Hermes" }];
+  const RUNTIMES = [{ value: "claude", label: "Claude Code" }, { value: "codex", label: "Codex" }, { value: "copilot", label: "Copilot CLI" }, { value: "opencode", label: "OpenCode" }, { value: "kimi", label: "Kimi Code" }, { value: "pi", label: "Pi" }, { value: "cursor", label: "Cursor" }, { value: "hermes", label: "Hermes" }, { value: "reasonix", label: "Reasonix" }];
   const machineOpts = machines.length ? machines.map((m) => ({ value: m.id, label: m.name || m.hostname || m.id, hint: m.status === "online" ? t("members.machineOnline") : t("members.machineOffline") })) : [];
   const selModel = models.find((m) => m.id === model);
   const thinkingLevels = selModel?.thinking?.levels ?? [];
@@ -580,13 +777,13 @@ export function CreateAgentModal({ onClose, prefill, onCreated }: { onClose: () 
   ];
   const modelLoadingOpts = [{ value: "", label: t("members.modelDetecting") }];
   return (
-    <div className="modal-bg" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-bg">
+      <div className="modal">
         <h3>{t("members.createAgentTitle")}</h3>
         <label>{t("members.computerLabel")}<span className="req-mark">*</span></label>
         <Select ariaLabel={t("members.computerAriaLabel")} value={machineId} options={machineOpts} onChange={(nextMachineId) => { setMachineId(nextMachineId); setProjectPath(""); setProjectPickerOpen(false); }} placeholder={t("members.noMachineOnline")} />
         {machineOpts.length === 0 && <div className="hint">{t("members.noMachineHint")}</div>}
-        <label>{t("members.nameLabel")}</label><input value={name} maxLength={64} onChange={(e) => setName(e.target.value)} placeholder={t("members.namePlaceholder")} />
+        <label>{t("members.nameLabel")}</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder={t("members.namePlaceholder")} />
         <label>{t("members.descriptionLabel")}</label><textarea value={desc} maxLength={3000} onChange={(e) => setDesc(e.target.value)} placeholder={t("members.descriptionPlaceholder")} />
         <label>{t("members.projectDirectoryLabel")}</label><ProjectDirectoryField value={projectPath} onChange={setProjectPath} machine={machines.find((machine) => machine.id === machineId)} pickerOpen={projectPickerOpen} onPickerOpenChange={setProjectPickerOpen} parentHandlesEscape />
         <div className="hint">{t("members.projectDirectoryHint")}</div>

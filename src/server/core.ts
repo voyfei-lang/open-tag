@@ -6,7 +6,7 @@ import { nextTaskNumber } from "../redis.js";
 import { agentControlBlockReason, broadcastToDaemons, conversationTurnDeliveryBlockReason, daemonCount, isMachineConnected, projectDirectoryBlockReason, requestDaemon, requestDaemonByMachine, sendToMachine } from "./daemonHub.js";
 import { createLogger } from "../log.js";
 import { canUserReadChannel } from "./channelAccess.js";
-import { canAutoJoinMentionedMembers } from "./agentWakePolicy.js";
+import { canAutoJoinMentionedMembers, type MessageSenderType } from "./agentWakePolicy.js";
 import { UUID_RE } from "./util.js";
 import { ensureReplyRecipients, releaseUnavailableReplyGrant } from "./replyCoordination.js";
 import type { ReplySlot } from "./replyCoordinationPolicy.js";
@@ -15,8 +15,27 @@ import { agentConfig } from "./agentConfig.js";
 import { attachMessageToConversationTurn, scheduleConversationTurn, type ConversationBoundaryKind } from "./conversationTurns.js";
 import { dispatchConversationTurn as dispatchConversationTurnWithDeps, dispatchLegacyMessage, prepareConversationTurnResponsibility, type ConversationTurnDispatchDeps } from "./conversationTurnDispatch.js";
 import { AGENT_CONTROL_ACK_CAPABILITY, DELIVERY_ADMISSION_CAPABILITY, PROJECT_DIRECTORY_CAPABILITY } from "../daemonProtocol.js";
+import { type AgentInputPolicy, inputSenderAllowed } from "./agentInputPolicy.js";
+import { agentInputVisible } from "./agentInputView.js";
 
 const log = createLogger("server:core");
+const ERROR_RECEIPT_WINDOW_MS = 10 * 60 * 1000;
+const activityReceiptTails = new Map<string, Promise<void>>();
+
+async function serializeActivityReceipt<T>(key: string, action: () => Promise<T>): Promise<T> {
+  const previous = activityReceiptTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  activityReceiptTails.set(key, current);
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (activityReceiptTails.get(key) === current) activityReceiptTails.delete(key);
+  }
+}
+
 const conversationTurnDispatchDeps: ConversationTurnDispatchDeps<AgentStartTarget> = {
   channelMembers,
   parseMentions,
@@ -38,9 +57,8 @@ export const DESC_TOO_LONG = `Description must be at most ${MAX_DESCRIPTION} cha
 export const descTooLong = (s: unknown): boolean => typeof s === "string" && s.length > MAX_DESCRIPTION;
 
 // Agent name is the @mention handle: used directly as @<name> (parseMentions re, CLI, web) and as the
-// dm:@<name> lookup key (resolveTarget). It must be a machine-safe identifier — spaces / punctuation /
-// emoji / leading digits break mention parsing and DM target resolution. Display-friendly text (Chinese,
-// spaces, emoji) belongs in displayName, which is unconstrained and drives all human-facing rendering.
+// dm:@<name> lookup key (resolveTarget). Unicode letters plus combining marks after the initial letter are
+// valid, while spaces / other punctuation / emoji remain displayName-only because they make tokenization ambiguous.
 // `agents.name` is an unbounded `text` column, so the length cap is enforced here, not by the DB.
 // Trailing / repeated hyphens (`bot--ok`, `my-agent-`) are intentionally allowed: they are harmless for
 // @mention / DM resolution since the mention charset itself includes `-`; GitHub-style "no trailing
@@ -48,9 +66,10 @@ export const descTooLong = (s: unknown): boolean => typeof s === "string" && s.l
 // inline mirror in web/src/views/Members.tsx (CreateAgentModal) — there is no shared module because the
 // web bundle must not import server code (it would pull in db/drizzle).
 export const MAX_AGENT_NAME = 64;
-export const AGENT_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
-export const INVALID_AGENT_NAME = `Agent name must be 1-${MAX_AGENT_NAME} characters, start with a letter, and contain only letters, numbers, hyphens, and underscores`;
-export const invalidAgentName = (s: unknown): boolean => typeof s !== "string" || s.length > MAX_AGENT_NAME || !AGENT_NAME_RE.test(s);
+export const AGENT_NAME_RE = /^\p{L}[\p{L}\p{M}\p{N}_-]*$/u;
+export const INVALID_AGENT_NAME = `Agent name must be 1-${MAX_AGENT_NAME} Unicode code points, start with a letter, and contain only letters, combining marks, numbers, hyphens, and underscores`;
+export const invalidAgentName = (s: unknown): boolean => typeof s !== "string" || [...s].length > MAX_AGENT_NAME || !AGENT_NAME_RE.test(s);
+export const normalizeAgentHandle = (s: string): string => s.trim().normalize("NFC");
 
 /** Create a workspace (server/community): create server + creator as owner + default #all channel + add owner to channel. Shared by dev-login / POST /api/servers / seed. */
 export async function createServer(name: string, slug: string, ownerId: string) {
@@ -105,11 +124,11 @@ export async function addChannelMembers(channelId: string, members: { type: "use
 
 export function parseMentions(content: string, members: Member[]) {
   const found = new Map<string, Member>();
-  const re = /@([A-Za-z0-9_\u4e00-\u9fa5-]+)/g;
+  const re = /@([\p{L}\p{M}\p{N}_-]+)/gu;
   let m: RegExpExecArray | null;
   while ((m = re.exec(content))) {
-    const name = m[1]!;
-    const hit = members.find((x) => x.name.toLowerCase() === name.toLowerCase());
+    const name = normalizeAgentHandle(m[1]!).toLowerCase();
+    const hit = members.find((x) => normalizeAgentHandle(x.name).toLowerCase() === name);
     if (hit) found.set(hit.id, hit);
   }
   return [...found.values()];
@@ -159,6 +178,29 @@ async function mentionAutoJoinPool(serverId: string, ch: typeof schema.channels.
     else log.warn("thread parent channel unresolved; @-mention reach falls back to thread members", { channelId: ch.id, parentMessageId: ch.parentMessageId });
   }
   return target.type === "channel" ? await workspaceMembers(serverId) : await channelMembers(target.id);
+}
+
+async function allowedMentionAutoJoinPool(
+  serverId: string,
+  senderType: MessageSenderType,
+  senderId: string | null,
+  pool: Member[],
+): Promise<Member[]> {
+  if (senderType !== "agent") return pool;
+  const agentIds = pool.filter((member) => member.type === "agent").map((member) => member.id);
+  const targets = agentIds.length ? await db.select({
+    id: schema.agents.id,
+    incomingMode: schema.agents.incomingMode,
+    commandWhitelist: schema.agents.commandWhitelist,
+  }).from(schema.agents).where(and(
+    eq(schema.agents.serverId, serverId),
+    isNull(schema.agents.deletedAt),
+    inArray(schema.agents.id, agentIds),
+  )) : [];
+  const allowedAgents = new Set(targets
+    .filter((target) => inputSenderAllowed(target, senderType, senderId))
+    .map((target) => target.id));
+  return pool.filter((member) => member.type === "user" || allowedAgents.has(member.id));
 }
 
 /** Add @-mentioned non-members to a channel, drawn from `pool` (its @-reach — see mentionAutoJoinPool); returns
@@ -214,19 +256,22 @@ async function publishThreadUpdated(
 }
 
 /** Aggregate message reactions into grouped shape: one entry per emoji {emoji,count,reactorIds,reactorNames}. */
-export async function aggregateReactions(messageIds: string[]): Promise<Map<string, ReactionAgg[]>> {
+export async function aggregateReactions(messageIds: string[], target?: AgentInputPolicy & { serverId: string }): Promise<Map<string, ReactionAgg[]>> {
   const out = new Map<string, ReactionAgg[]>();
   if (!messageIds.length) return out;
   const rows = await db.select().from(schema.reactions).where(inArray(schema.reactions.messageId, messageIds));
   if (!rows.length) return out;
-  const uIds = [...new Set(rows.filter((r) => r.memberType === "user").map((r) => r.memberId))];
-  const aIds = [...new Set(rows.filter((r) => r.memberType === "agent").map((r) => r.memberId))];
+  const visibleRows = target?.incomingMode !== "sealed"
+    ? rows
+    : rows.filter((r) => inputSenderAllowed(target, r.memberType, r.memberId));
+  const uIds = [...new Set(visibleRows.filter((r) => r.memberType === "user").map((r) => r.memberId))];
+  const aIds = [...new Set(visibleRows.filter((r) => r.memberType === "agent").map((r) => r.memberId))];
   const users = uIds.length ? await db.select().from(schema.users).where(inArray(schema.users.id, uIds)) : [];
   const agents = aIds.length ? await db.select().from(schema.agents).where(inArray(schema.agents.id, aIds)) : [];
   const nameOf = (t: string, id: string) => t === "user"
     ? (users.find((u) => u.id === id)?.displayName || users.find((u) => u.id === id)?.name || "?")
     : (agents.find((a) => a.id === id)?.displayName || agents.find((a) => a.id === id)?.name || "?");
-  for (const r of rows) {
+  for (const r of visibleRows) {
     const list = out.get(r.messageId) ?? [];
     let e = list.find((x) => x.emoji === r.emoji);
     if (!e) { e = { emoji: r.emoji, count: 0, reactorIds: [], reactorNames: [] }; list.push(e); }
@@ -236,26 +281,40 @@ export async function aggregateReactions(messageIds: string[]): Promise<Map<stri
   return out;
 }
 
-async function serializeMessageById(messageId: string) {
+async function serializeMessageById(messageId: string, target?: AgentInputPolicy & { serverId: string }) {
   const msg = (await db.select().from(schema.messages).where(eq(schema.messages.id, messageId)))[0];
   if (!msg) return null;
   const mts = await db.select().from(schema.messageMentions).where(eq(schema.messageMentions.messageId, messageId));
   const mentions: Member[] = mts.map((x) => ({ type: x.mentionType as "user" | "agent", id: x.mentionId, name: x.mentionName, displayName: x.mentionName }));
   const atts = await db.select().from(schema.attachments).where(eq(schema.attachments.messageId, messageId));
-  const reactions = (await aggregateReactions([messageId])).get(messageId) ?? [];
+  const reactions = (await aggregateReactions([messageId], target)).get(messageId) ?? [];
   return serializeMsg(msg, mentions, atts, reactions);
 }
 
 /** Add reaction (add-or-noop): unique index deduplication, broadcast message:updated. */
-export async function addReaction(serverId: string, messageId: string, memberType: "user" | "agent", memberId: string, emoji: string) {
+export async function addReaction(
+  serverId: string,
+  messageId: string,
+  memberType: "user" | "agent",
+  memberId: string,
+  emoji: string,
+  reactionTarget?: AgentInputPolicy & { serverId: string },
+) {
   await db.insert(schema.reactions).values({ messageId, memberType, memberId, emoji }).onConflictDoNothing();
-  const m = await serializeMessageById(messageId);
+  const m = await serializeMessageById(messageId, reactionTarget);
   if (m) await publish(serverId, { type: "message:updated", message: m });
   return m;
 }
-export async function removeReaction(serverId: string, messageId: string, memberType: "user" | "agent", memberId: string, emoji: string) {
+export async function removeReaction(
+  serverId: string,
+  messageId: string,
+  memberType: "user" | "agent",
+  memberId: string,
+  emoji: string,
+  reactionTarget?: AgentInputPolicy & { serverId: string },
+) {
   await db.delete(schema.reactions).where(and(eq(schema.reactions.messageId, messageId), eq(schema.reactions.memberType, memberType), eq(schema.reactions.memberId, memberId), eq(schema.reactions.emoji, emoji)));
-  const m = await serializeMessageById(messageId);
+  const m = await serializeMessageById(messageId, reactionTarget);
   if (m) await publish(serverId, { type: "message:updated", message: m });
   return m;
 }
@@ -334,6 +393,7 @@ export async function createMessage(opts: {
   replyToMessageId?: string; replyGrantSlot?: ReplySlot;
   actionMetadata?: unknown; // action-card and other platform action payloads (slice09)
   agentActivity?: AgentActivityItem[]; agentActivityStreamId?: string | null; agentActivityState?: "running" | "handled" | "error" | null;
+  agentActivityRows?: (typeof schema.agentActivityLog.$inferSelect)[];
 }) {
   const claimedActivity = opts.senderType === "agent" && opts.senderId && opts.messageType !== "agent_activity_receipt" && !opts.agentActivityStreamId
     ? await claimPendingAgentActivity(opts.serverId, opts.senderId, opts.channelId)
@@ -355,7 +415,8 @@ export async function createMessage(opts: {
   // Channel row fetched once; its type drives task-number scope (per-DM vs per-server), thread auto-follow, mention auto-join, and wake routing below.
   const ch = (await db.select().from(schema.channels).where(eq(schema.channels.id, opts.channelId)))[0];
   const taskNumber = opts.asTask ? await nextTaskNumber(opts.serverId, ch) : null;
-  const [msg] = await db.insert(schema.messages).values({
+  const activityRows = opts.agentActivityRows ?? claimedActivity?.rows ?? [];
+  const messageValues = {
     seq, serverId: opts.serverId, channelId: opts.channelId,
     senderType: opts.senderType, senderId: opts.senderId, senderName: opts.senderName,
     messageType: opts.messageType ?? "chat", content: opts.content,
@@ -367,8 +428,17 @@ export async function createMessage(opts: {
     taskStatus: opts.asTask ? "todo" : null, taskNumber,
     replyToMessageId: opts.replyToMessageId ?? null,
     replyGrantSlot: opts.replyGrantSlot ?? null,
-  }).returning();
-  if (claimedActivity) await assignActivityRows(claimedActivity.rows, msg!.id);
+  };
+  const msg = activityRows.length
+    ? await db.transaction(async (tx) => {
+      const [created] = await tx.insert(schema.messages).values(messageValues).returning();
+      await tx.update(schema.agentActivityLog).set({ messageId: created!.id }).where(and(
+        isNull(schema.agentActivityLog.messageId),
+        inArray(schema.agentActivityLog.id, activityRows.map((row) => row.id)),
+      ));
+      return created;
+    })
+    : (await db.insert(schema.messages).values(messageValues).returning())[0];
 
   // auto-follow: reply to thread → sender auto-joins; replying after done clears done and brings thread back to inbox
   if (opts.senderId && opts.senderType !== "system" && ch?.type === "thread") {
@@ -392,7 +462,13 @@ export async function createMessage(opts: {
   // A resolvable mention is an active work edge for human and agent senders. The reach pool still preserves
   // the channel boundary: public spaces may pull in workspace peers; private/DM spaces never pull outsiders.
   if (ch && canAutoJoinMentionedMembers(opts.senderType) && opts.content.includes("@")) {
-    const joined = await autoJoinMentioned(opts.serverId, opts.channelId, opts.content, members, await mentionAutoJoinPool(opts.serverId, ch), seq - 1);
+    const reach = await allowedMentionAutoJoinPool(
+      opts.serverId,
+      opts.senderType,
+      opts.senderId,
+      await mentionAutoJoinPool(opts.serverId, ch),
+    );
+    const joined = await autoJoinMentioned(opts.serverId, opts.channelId, opts.content, members, reach, seq - 1);
     if (joined.length) members = [...members, ...joined];
   }
   const mentions = parseMentions(opts.content, members);
@@ -464,6 +540,10 @@ export async function dispatchConversationTurn(turnId: string): Promise<void> {
 }
 
 export async function finalizeAgentActivityRun(serverId: string, agentId: string, channelId: string, streamId: string, agentName: string, state: "handled" | "error"): Promise<void> {
+  return serializeActivityReceipt(`${serverId}:${agentId}:${channelId}`, () => finalizeAgentActivityRunNow(serverId, agentId, channelId, streamId, agentName, state));
+}
+
+async function finalizeAgentActivityRunNow(serverId: string, agentId: string, channelId: string, streamId: string, agentName: string, state: "handled" | "error"): Promise<void> {
   const pending = await pendingActivityForStream(serverId, agentId, channelId, streamId);
   const [last] = await db.select().from(schema.messages).where(and(
     eq(schema.messages.serverId, serverId),
@@ -479,10 +559,48 @@ export async function finalizeAgentActivityRun(serverId: string, agentId: string
     if (updated) await publish(serverId, { type: "message:updated", message: updated });
     return;
   }
+  if (!pending.rows.length) {
+    const [claimed] = await db.select({ id: schema.agentActivityLog.id }).from(schema.agentActivityLog).where(and(
+      eq(schema.agentActivityLog.serverId, serverId),
+      eq(schema.agentActivityLog.agentId, agentId),
+      eq(schema.agentActivityLog.channelId, channelId),
+      eq(schema.agentActivityLog.streamId, streamId),
+      isNotNull(schema.agentActivityLog.messageId),
+    )).limit(1);
+    if (claimed) return;
+  }
+  if (state === "error") {
+    const recent = (await db.select().from(schema.messages).where(and(
+      eq(schema.messages.serverId, serverId),
+      eq(schema.messages.channelId, channelId),
+      eq(schema.messages.senderType, "agent"),
+      eq(schema.messages.senderId, agentId),
+      eq(schema.messages.messageType, "agent_activity_receipt"),
+      eq(schema.messages.agentActivityState, "error"),
+      gt(schema.messages.createdAt, new Date(Date.now() - ERROR_RECEIPT_WINDOW_MS)),
+    )).orderBy(desc(schema.messages.seq)).limit(1))[0];
+    if (recent) {
+      await db.transaction(async (tx) => {
+        await tx.update(schema.messages).set({
+          agentActivity: [...(recent.agentActivity ?? []), ...pending.items],
+          agentActivityStreamId: streamId,
+          updatedAt: new Date(),
+        }).where(eq(schema.messages.id, recent.id));
+        if (pending.rows.length) await tx.update(schema.agentActivityLog).set({ messageId: recent.id }).where(and(
+          isNull(schema.agentActivityLog.messageId),
+          inArray(schema.agentActivityLog.id, pending.rows.map((row) => row.id)),
+        ));
+      });
+      const updated = await serializeMessageById(recent.id);
+      if (updated) await publish(serverId, { type: "message:updated", message: updated });
+      return;
+    }
+  }
   await createMessage({
     serverId, channelId, senderType: "agent", senderId: agentId, senderName: agentName,
     content: "", messageType: "agent_activity_receipt",
     agentActivity: pending.items, agentActivityStreamId: streamId, agentActivityState: state,
+    agentActivityRows: pending.rows,
   });
 }
 
@@ -542,12 +660,20 @@ export async function resolveTarget(serverId: string, target: string, selfAgentI
     // The peer user must belong to THIS server (the agent lookup below is already server-scoped); otherwise an
     // agent could open a cross-tenant DM to any global username. users.name is global, so gate on serverMembers.
     const u = uRow && (await db.select().from(schema.serverMembers).where(and(eq(schema.serverMembers.serverId, serverId), eq(schema.serverMembers.userId, uRow.id))))[0] ? uRow : undefined;
-    const a = (await db.select().from(schema.agents).where(and(eq(schema.agents.name, peer), eq(schema.agents.serverId, serverId))))[0];
+    const a = (await db.select().from(schema.agents).where(and(
+      eq(schema.agents.name, normalizeAgentHandle(peer)),
+      eq(schema.agents.serverId, serverId),
+      isNull(schema.agents.deletedAt),
+    )))[0];
     const peerId = u?.id ?? a?.id; const peerType = u ? "user" : a ? "agent" : null;
     if (!peerId || !peerType) return null;
     baseChannelId = await getOrCreateDM(serverId, selfAgentId, "agent", peerId, peerType);
   } else {
-    const ch = (await db.select().from(schema.channels).where(and(eq(schema.channels.serverId, serverId), eq(schema.channels.name, t.replace(/^#/, "")))))[0];
+    const ch = (await db.select().from(schema.channels).where(and(
+      eq(schema.channels.serverId, serverId),
+      eq(schema.channels.name, t.replace(/^#/, "")),
+      isNull(schema.channels.deletedAt),
+    )))[0];
     baseChannelId = ch?.id ?? null;
   }
   if (!baseChannelId) return null;
@@ -690,11 +816,24 @@ export async function resolveIdOrPrefix(
 export async function resolveMessageId(serverId: string, idOrShort: string | undefined | null, agentId?: string): Promise<string | null> {
   const id = await resolveIdOrPrefix(schema.messages, serverId, idOrShort);
   if (!id) return null;
-  const m = (await db.select({ id: schema.messages.id, channelId: schema.messages.channelId }).from(schema.messages).where(eq(schema.messages.id, id)))[0];
+  const m = (await db.select().from(schema.messages).where(eq(schema.messages.id, id)))[0];
   if (!m) return null;
   // Agent ACL: on the agent plane (agentId passed), only resolve a message in a channel the agent can access —
   // otherwise an agent could probe/react/claim any message in the server by its (short) id.
   if (agentId && !(await canAgentReadChannel(serverId, m.channelId, agentId))) return null;
+  if (agentId) {
+    const target = (await db.select({
+      id: schema.agents.id,
+      serverId: schema.agents.serverId,
+      incomingMode: schema.agents.incomingMode,
+      commandWhitelist: schema.agents.commandWhitelist,
+    }).from(schema.agents).where(and(
+      eq(schema.agents.id, agentId),
+      eq(schema.agents.serverId, serverId),
+      isNull(schema.agents.deletedAt),
+    )))[0];
+    if (!target || !await agentInputVisible(target, m)) return null;
+  }
   return m.id;
 }
 
@@ -738,6 +877,7 @@ export async function assignTask(
     isNull(schema.agents.deletedAt),
   )))[0];
   if (!target) return null;
+  if (by?.type === "agent" && !inputSenderAllowed(target, by.type, by.id)) return null;
 
   const cur = (await db.select().from(schema.messages).where(and(
     eq(schema.messages.id, messageId),
@@ -824,8 +964,17 @@ export async function setTaskStatus(serverId: string, messageId: string, status:
   const label = STATUS_LABEL[status] ?? status;
   const emoji = STATUS_EMOJI[status] ? STATUS_EMOJI[status] + " " : ""; // confirmed for in_progress/in_review; others pending confirmation, no guessing
   const sysMsg = await sysTaskMsg(serverId, threadCh, `${emoji}${actor} moved #${upd.taskNumber} "${taskTitle(upd.content)}" to ${label}`, by);
+  let assigneeAcceptsSource = true;
+  if (by?.type === "agent" && upd.taskAssigneeId) {
+    const target = (await db.select().from(schema.agents).where(and(
+      eq(schema.agents.id, upd.taskAssigneeId),
+      eq(schema.agents.serverId, serverId),
+      isNull(schema.agents.deletedAt),
+    )))[0];
+    assigneeAcceptsSource = !!target && inputSenderAllowed(target, "agent", by.id);
+  }
   // Wake the assigned agent (only when changed by someone else). Verified: human changes status → assignee agent fires agent:activity working detail="Message received".
-  if (upd.taskAssigneeType === "agent" && upd.taskAssigneeId && by?.id !== upd.taskAssigneeId) {
+  if (upd.taskAssigneeType === "agent" && upd.taskAssigneeId && by?.id !== upd.taskAssigneeId && assigneeAcceptsSource) {
     await db.insert(schema.channelMembers).values({ channelId: threadCh, memberType: "agent", memberId: upd.taskAssigneeId }).onConflictDoNothing(); // ensure assignee is a thread member, otherwise message check cannot see this system message
     const target = await agentStartTarget(serverId, upd.taskAssigneeId);
     await ensureReplyRecipients({ serverId, channelId: threadCh, messageId: sysMsg.id, recipients: [{ agentId: upd.taskAssigneeId, attention: "assigned" }] });
@@ -904,6 +1053,27 @@ export async function wakeAgentForReplyCoordination(serverId: string, agentId: s
     mentioned: true, message: { content: "reply coordination update" },
   });
   if (!delivered) await releaseUnavailableReplyGrant(messageId, agentId);
+  return delivered;
+}
+
+/** Best-effort content-free wake for a persisted lifecycle notice. It creates no reply grant. */
+export async function wakeAgentForLifecycleNotice(
+  serverId: string,
+  agentId: string,
+  notice: { channelId: string; channelName: string; seq: number },
+): Promise<boolean> {
+  const target = await agentStartTarget(serverId, agentId);
+  if (!target.ok) return false;
+  const started = sendAgentStart(serverId, target, agentId);
+  const delivered = started && sendAgentDeliver(serverId, target, {
+    agentId,
+    seq: notice.seq,
+    from: "system",
+    target: notice.channelId,
+    targetName: `#${notice.channelName} (deleted)`,
+    attention: "lifecycle",
+  });
+  if (!delivered) await markAgentUnavailable(serverId, agentId, "machine offline");
   return delivered;
 }
 

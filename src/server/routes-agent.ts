@@ -1,6 +1,6 @@
 // Agent-side REST: /agent-api/*  (Bearer per-agent token sk_agent_* + x-agent-id; NOT a machine/bootstrap key — see docs/authorization.md §1)
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { and, eq, ne, gt, lt, inArray, asc, desc, ilike, like, sql, isNull, isNotNull } from "drizzle-orm";
+import { and, eq, ne, gt, lt, inArray, asc, desc, ilike, like, max, sql, isNull, isNotNull } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { sendJson, sendErr, readJson, bearer, agentIdHeader } from "./util.js";
 import { resolveAgent } from "./auth.js";
@@ -14,6 +14,9 @@ import { validateDecisionInput } from "./replyCoordinationPolicy.js";
 import { canonicalReplyTriggerMessageId } from "./conversationTurns.js";
 import { conversationTurnDeliveryBlockReason } from "./daemonHub.js";
 import { isConversationTurnCapabilityPaused } from "./conversationTurnRecovery.js";
+import { CHANNEL_DELETED_NOTICE_KIND, channelDeletedNoticeForAgent, type ChannelDeletedNoticeMetadata } from "./channelDeletionNotice.js";
+import { inputSenderAllowed } from "./agentInputPolicy.js";
+import { agentInputVisible, filterAgentInputView } from "./agentInputView.js";
 
 // Freshness-hold draft buffer (prevents agent↔agent duplicate replies): when the agent sends
 // and new messages have arrived since last read → save as draft + surface bounded context, do not post immediately.
@@ -131,6 +134,74 @@ export const fmt = (m: typeof schema.messages.$inferSelect, target: string, atts
 
 type InboxMessage = typeof schema.messages.$inferSelect;
 
+type ClaimedChannelDeletionNotice = {
+  message: InboxMessage;
+  metadata: ChannelDeletedNoticeMetadata;
+};
+
+async function claimChannelDeletionNotices(
+  serverId: string,
+  agentId: string,
+): Promise<ClaimedChannelDeletionNotice[]> {
+  return db.transaction(async (tx) => {
+    const candidates = await tx.select({
+      message: schema.messages,
+    }).from(schema.messages)
+      .innerJoin(schema.channels, eq(schema.channels.id, schema.messages.channelId))
+      .leftJoin(schema.agentMessageObservations, and(
+        eq(schema.agentMessageObservations.messageId, schema.messages.id),
+        eq(schema.agentMessageObservations.agentId, agentId),
+      ))
+      .where(and(
+        eq(schema.messages.serverId, serverId),
+        eq(schema.channels.serverId, serverId),
+        isNotNull(schema.channels.deletedAt),
+        eq(schema.messages.senderType, "system"),
+        eq(schema.messages.messageType, "system"),
+        isNull(schema.agentMessageObservations.messageId),
+        sql<boolean>`${schema.messages.actionMetadata} @> ${JSON.stringify({
+          kind: CHANNEL_DELETED_NOTICE_KIND,
+          recipientAgentIds: [agentId],
+        })}::jsonb`,
+        sql<boolean>`${schema.messages.actionMetadata}->>'channelId' = ${schema.messages.channelId}::text`,
+      ))
+      .orderBy(asc(schema.messages.seq))
+      .limit(100);
+    const valid = candidates.flatMap(({ message }) => {
+      const metadata = channelDeletedNoticeForAgent(message.actionMetadata, message.channelId, agentId);
+      return metadata ? [{ message, metadata }] : [];
+    });
+    if (!valid.length) return [];
+
+    const inserted = await tx.insert(schema.agentMessageObservations).values(valid.map(({ message }) => ({
+      messageId: message.id,
+      agentId,
+      serverId,
+    }))).onConflictDoNothing().returning({ messageId: schema.agentMessageObservations.messageId });
+    const claimedIds = new Set(inserted.map(({ messageId }) => messageId));
+    const claimed = valid.filter(({ message }) => claimedIds.has(message.id));
+    if (!claimed.length) return [];
+
+    const channelIds = [...new Set(claimed.map(({ message }) => message.channelId))];
+    const watermarks = await tx.select({
+      channelId: schema.messages.channelId,
+      seq: max(schema.messages.seq),
+    }).from(schema.messages)
+      .where(and(eq(schema.messages.serverId, serverId), inArray(schema.messages.channelId, channelIds)))
+      .groupBy(schema.messages.channelId);
+    for (const watermark of watermarks) {
+      await tx.update(schema.channelMembers).set({
+        lastReadSeq: sql<number>`greatest(${schema.channelMembers.lastReadSeq}, ${Number(watermark.seq ?? 0)})`,
+      }).where(and(
+        eq(schema.channelMembers.channelId, watermark.channelId),
+        eq(schema.channelMembers.memberType, "agent"),
+        eq(schema.channelMembers.memberId, agentId),
+      ));
+    }
+    return claimed;
+  });
+}
+
 async function classifyInboxVisibility(opts: {
   agentId: string;
   messages: InboxMessage[];
@@ -219,8 +290,14 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     let capabilityPaused = await agentHasCapabilityPausedTurn(agent.id);
     let topologyBlocked = false;
     if (!durableDeliveryBlock) await authorizePendingDmGrants(agent.id);
-    const cms = await agentChannels(agent.id);
     const out: any[] = [];
+    const deletionNotices = await claimChannelDeletionNotices(serverId, agent.id);
+    out.push(...deletionNotices.map(({ message, metadata }) => ({
+      ...serialize(message),
+      coordination: null,
+      text: fmt(message, `#${metadata.channelName}`),
+    })));
+    const cms = await agentChannels(agent.id);
     for (const cm of cms) {
       const ch = (await db.select().from(schema.channels).where(eq(schema.channels.id, cm.channelId)))[0];
       if (!ch || ch.deletedAt) continue;
@@ -228,8 +305,8 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
       const visibility = await classifyInboxVisibility({ agentId: agent.id, messages: unread, durableDeliveryBlock, purpose: "inbox" });
       capabilityPaused ||= visibility.capabilityPaused;
       topologyBlocked ||= visibility.topologyBlocked;
-      const stable = visibility.visible;
-      const stableForeign = stable.filter((message) => message.senderId !== agent.id);
+      const stable = await filterAgentInputView(agent, visibility.visible);
+      const stableForeign = stable.filter((message) => message.senderType !== "agent" || message.senderId !== agent.id);
       const observedRows = stableForeign.length
         ? await db.select({ messageId: schema.agentMessageObservations.messageId }).from(schema.agentMessageObservations).where(and(
           eq(schema.agentMessageObservations.agentId, agent.id),
@@ -267,11 +344,11 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
       }
       // Persisted observation de-duplicates stable messages beyond a collecting gap. The scalar channel
       // cursor advances only through the contiguous prefix, so the hidden Turn cannot be skipped forever.
-      if (visibility.cursorPrefix.length) await db.update(schema.channelMembers).set({ lastReadSeq: visibility.cursorPrefix.at(-1)!.seq })
+      if (visibility.cursorPrefix.length) await db.update(schema.channelMembers).set({ lastReadSeq: sql<number>`greatest(${schema.channelMembers.lastReadSeq}, ${visibility.cursorPrefix.at(-1)!.seq})` })
         .where(and(eq(schema.channelMembers.channelId, cm.channelId), eq(schema.channelMembers.memberType, "agent"), eq(schema.channelMembers.memberId, agent.id)));
     }
     const coordination: any[] = [];
-    for (const update of durableDeliveryBlock ? [] : await claimReplyCoordination(agent.id)) {
+    for (const update of durableDeliveryBlock ? [] : await claimReplyCoordination(serverId, agent.id)) {
       const requester = (await db.select({ name: schema.agents.name }).from(schema.agents).where(and(
         eq(schema.agents.id, update.requesterAgentId), eq(schema.agents.serverId, serverId),
       )))[0];
@@ -319,7 +396,10 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
       reason: valid.reason, summary: typeof b.summary === "string" ? b.summary : undefined,
       delegateToAgentId,
     });
-    if (!result.ok) return (sendErr(res, 409, "reply decision rejected", { code: result.code }), true);
+    if (!result.ok) {
+      const status = result.code === "INPUT_SOURCE_REJECTED" ? 403 : 409;
+      return (sendErr(res, status, "reply decision rejected", { code: result.code }), true);
+    }
     if (result.notifyAgentId) await wakeAgentForReplyCoordination(serverId, result.notifyAgentId, messageId, agent.name);
     if (result.promotedAgentId) await wakeAgentForReplyCoordination(serverId, result.promotedAgentId, messageId, agent.name);
     return (sendJson(res, 200, {
@@ -394,7 +474,8 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
       durableDeliveryBlock: conversationTurnDeliveryBlockReason(serverId, agent.machineId),
       purpose: "freshness",
     });
-    const visibleForeign = visibility.visible.filter((m) => m.senderId !== agent.id && m.senderType !== "system");
+    const protectedVisible = await filterAgentInputView(agent, visibility.visible);
+    const visibleForeign = protectedVisible.filter((m) => m.senderId !== agent.id && m.senderType !== "system");
     const observedRows = visibleForeign.length
       ? await db.select({ messageId: schema.agentMessageObservations.messageId }).from(schema.agentMessageObservations).where(and(
         eq(schema.agentMessageObservations.agentId, agent.id),
@@ -410,7 +491,7 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
         replyToMessageId: replyToMessageId ?? undefined,
         reviewedMessageIds: [...new Set([...(existingDraft?.reviewedMessageIds ?? []), ...newer.map((message) => message.id)])],
       });
-      if (visibility.cursorPrefix.length) await db.update(schema.channelMembers).set({ lastReadSeq: visibility.cursorPrefix.at(-1)!.seq }).where(and(eq(schema.channelMembers.channelId, tgt.channelId), eq(schema.channelMembers.memberType, "agent"), eq(schema.channelMembers.memberId, agent.id))); // Advance only through the contiguous admitted prefix; a queued Turn must remain unread.
+      if (visibility.cursorPrefix.length) await db.update(schema.channelMembers).set({ lastReadSeq: sql<number>`greatest(${schema.channelMembers.lastReadSeq}, ${visibility.cursorPrefix.at(-1)!.seq})` }).where(and(eq(schema.channelMembers.channelId, tgt.channelId), eq(schema.channelMembers.memberType, "agent"), eq(schema.channelMembers.memberId, agent.id))); // Advance only through the contiguous admitted prefix; a queued Turn must remain unread.
       const ch = (await db.select().from(schema.channels).where(eq(schema.channels.id, tgt.channelId)))[0]!;
       const tname = await addressableTarget(ch, agent.id);
       const history = newer.map((m) => fmt(m, tname)).join("\n");
@@ -457,7 +538,7 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     if (!b.messageId || !emoji) return (sendErr(res, 400, "messageId + emoji required"), true);
     const mid = await resolveMessageId(serverId, b.messageId, agent.id); // Tolerates short id (agent reacts to the short id it sees); without this, querying uuid column with a short id → 500
     if (!mid) return (sendErr(res, 404, "message not found"), true);
-    const out = b.remove ? await removeReaction(serverId, mid, "agent", agent.id, emoji) : await addReaction(serverId, mid, "agent", agent.id, emoji);
+    const out = b.remove ? await removeReaction(serverId, mid, "agent", agent.id, emoji, agent) : await addReaction(serverId, mid, "agent", agent.id, emoji, agent);
     return (sendJson(res, 200, { ok: true, reactions: out?.reactions ?? [] }), true);
   }
   if (p === "/agent-api/message/read" && method === "GET") {
@@ -488,6 +569,7 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     } else {
       rows = (await db.select().from(schema.messages).where(cid).orderBy(desc(schema.messages.seq)).limit(limit)).reverse();
     }
+    rows = await filterAgentInputView(agent, rows);
     return (sendJson(res, 200, { messages: rows.map((m) => ({ ...serialize(m), text: fmt(m, tstr) })) }), true);
   }
 
@@ -504,7 +586,11 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
       // Agent ACL: only surface public channels + channels the agent has joined — never reveal a private
       // channel's name/description to a non-member (DMs are listed elsewhere). Keeps private channels invisible.
       channels: chs.filter((c) => c.type !== "dm" && c.type !== "thread" && !c.deletedAt && (c.type === "channel" || joined.has(c.id))).map((c) => ({ name: c.name, description: c.description, joined: joined.has(c.id), type: c.type })),
-      agents: agents.map((a) => ({ name: a.name, status: a.status, description: a.description ?? null })),
+      agents: agents.map((a) => ({
+        name: a.name,
+        status: a.status,
+        description: inputSenderAllowed(agent, "agent", a.id) ? a.description ?? null : null,
+      })),
       humans: humans.map((u) => ({ name: u.name, description: u.description ?? null })),
     }), true);
   }
@@ -532,19 +618,29 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     const cur = (await db.select({ s: schema.messages.taskStatus }).from(schema.messages).where(eq(schema.messages.id, mid)))[0];
     if (cur && !cur.s) await convertMessageToTask(serverId, mid, { type: "agent", id: agent.id });
   };
+  const resolveTaskNumberForAgent = async (channel: unknown, number: unknown): Promise<string | null> => {
+    const tgt = await resolveTarget(serverId, String(channel), agent.id);
+    if (!tgt) return null;
+    const task = (await db.select().from(schema.messages).where(and(
+      eq(schema.messages.channelId, tgt.channelId),
+      eq(schema.messages.taskNumber, Number(number)),
+      isNotNull(schema.messages.taskStatus),
+    )))[0];
+    return task && await agentInputVisible(agent, task) ? task.id : null;
+  };
   if (p === "/agent-api/task/list" && method === "GET") {
     const tgt = await resolveTarget(serverId, url.searchParams.get("channel") ?? "", agent.id);
     if (!tgt) return (sendErr(res, 404, "channel not found"), true);
     const tasks = await db.select().from(schema.messages).where(and(eq(schema.messages.channelId, tgt.channelId))).orderBy(asc(schema.messages.taskNumber));
-    return (sendJson(res, 200, { tasks: tasks.filter((m) => m.taskStatus).map((m) => ({ number: m.taskNumber, status: m.taskStatus, content: m.content, id: m.id, assigneeId: m.taskAssigneeId })) }), true);
+    const visibleTasks = await filterAgentInputView(agent, tasks.filter((message) => !!message.taskStatus));
+    return (sendJson(res, 200, { tasks: visibleTasks.map((m) => ({ number: m.taskNumber, status: m.taskStatus, content: m.content, id: m.id, assigneeId: m.taskAssigneeId })) }), true);
   }
   if (p === "/agent-api/task/claim" && method === "POST") {
     const b = await readJson(req);
     // Supports --channel "#ch" --number N (agent sees task as #N), or --message-id (short/full id)
     let mid: string | null = null;
     if (b.number != null && b.channel) {
-      const tgt = await resolveTarget(serverId, String(b.channel), agent.id);
-      if (tgt) mid = (await db.select({ id: schema.messages.id }).from(schema.messages).where(and(eq(schema.messages.channelId, tgt.channelId), eq(schema.messages.taskNumber, Number(b.number)))))[0]?.id ?? null;
+      mid = await resolveTaskNumberForAgent(b.channel, b.number);
     } else {
       mid = await resolveMessageId(serverId, b.messageId, agent.id); // Tolerates 8-character short id
     }
@@ -568,8 +664,7 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     // Supports --channel + --number (agent sees task as #N), or --message-id
     let mid: string | null = null;
     if (b.number != null && b.channel) {
-      const tgt = await resolveTarget(serverId, String(b.channel), agent.id);
-      if (tgt) mid = (await db.select({ id: schema.messages.id }).from(schema.messages).where(and(eq(schema.messages.channelId, tgt.channelId), eq(schema.messages.taskNumber, Number(b.number)))))[0]?.id ?? null;
+      mid = await resolveTaskNumberForAgent(b.channel, b.number);
     } else {
       mid = await resolveMessageId(serverId, b.messageId, agent.id);
     }
@@ -595,15 +690,13 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
       isNull(schema.agents.deletedAt),
     )))[0];
     if (!targetAgent) return (sendErr(res, 404, "target agent not found"), true);
+    if (!inputSenderAllowed(targetAgent, "agent", agent.id)) {
+      return (sendErr(res, 403, "target agent does not accept commands from this agent"), true);
+    }
 
     let mid: string | null = null;
     if (b.number != null && b.channel) {
-      const tgt = await resolveTarget(serverId, String(b.channel), agent.id);
-      if (tgt) mid = (await db.select({ id: schema.messages.id }).from(schema.messages).where(and(
-        eq(schema.messages.channelId, tgt.channelId),
-        eq(schema.messages.taskNumber, Number(b.number)),
-        isNotNull(schema.messages.taskStatus),
-      )))[0]?.id ?? null;
+      mid = await resolveTaskNumberForAgent(b.channel, b.number);
     } else {
       mid = await resolveMessageId(serverId, b.messageId, agent.id);
     }
@@ -645,6 +738,7 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     // Agent ACL: a bare parent short id (no channel given) skips resolveTarget, so gate on the found parent's
     // channel — otherwise an agent could read/reply into a thread under a private channel it can't access.
     if (parent && !(await canAgentReadChannel(serverId, parent.channelId, agent.id))) return null;
+    if (parent && !await agentInputVisible(agent, parent)) return null;
     return parent;
   };
   if (p === "/agent-api/thread/reply" && method === "POST") {
@@ -687,7 +781,8 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     const tstr = `thread:${parent.id.slice(0, 8)}`;
     if (!th) return (sendJson(res, 200, { parent: { senderName: parent.senderName, content: parent.content }, messages: [] }), true);
     const msgs = await db.select().from(schema.messages).where(and(eq(schema.messages.channelId, th.id), ne(schema.messages.messageType, "agent_activity_receipt"))).orderBy(asc(schema.messages.seq)).limit(100);
-    return (sendJson(res, 200, { parent: { senderName: parent.senderName, content: parent.content }, messages: msgs.map((m) => ({ ...serialize(m), text: fmt(m, tstr) })) }), true);
+    const visible = await filterAgentInputView(agent, msgs);
+    return (sendJson(res, 200, { parent: { senderName: parent.senderName, content: parent.content }, messages: visible.map((m) => ({ ...serialize(m), text: fmt(m, tstr) })) }), true);
   }
   // Full-text search (agent self-queries context): searches only channels the agent belongs to, ilike substring match
   if (p === "/agent-api/search" && method === "GET") {
@@ -697,18 +792,38 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     if (!joined.length) return (sendJson(res, 200, { results: [] }), true);
     const rows = await db.select().from(schema.messages)
       .where(and(eq(schema.messages.serverId, serverId), inArray(schema.messages.channelId, joined), ilike(schema.messages.content, `%${q}%`)))
-      .orderBy(desc(schema.messages.seq)).limit(20);
-    return (sendJson(res, 200, { results: rows.map((m) => ({ id: m.id, channelId: m.channelId, senderType: m.senderType, senderName: m.senderName, content: m.content, createdAt: m.createdAt })) }), true);
+      .orderBy(desc(schema.messages.seq)).limit(100);
+    const visible = (await filterAgentInputView(agent, rows)).slice(0, 20);
+    return (sendJson(res, 200, { results: visible.map((m) => ({ id: m.id, channelId: m.channelId, senderType: m.senderType, senderName: m.senderName, content: m.content, createdAt: m.createdAt })) }), true);
   }
 
   // profile show: own profile or @handle lookup
   if (p === "/agent-api/profile/show" && method === "GET") {
     const who = (url.searchParams.get("handle") || "").replace(/^@/, "");
     const a = who
-      ? (await db.select().from(schema.agents).where(and(eq(schema.agents.serverId, serverId), eq(schema.agents.name, who))))[0]
+      ? (await db.select().from(schema.agents).where(and(
+        eq(schema.agents.serverId, serverId),
+        eq(schema.agents.name, who),
+        isNull(schema.agents.deletedAt),
+      )))[0]
       : (await db.select().from(schema.agents).where(eq(schema.agents.id, agent.id)))[0];
-    if (a) return (sendJson(res, 200, { type: "agent", name: a.name, displayName: a.displayName, description: a.description, runtime: a.runtime, model: a.model, status: a.status }), true);
-    const u = who ? (await db.select().from(schema.users).where(eq(schema.users.name, who)))[0] : null;
+    if (a) {
+      const profileTextAllowed = inputSenderAllowed(agent, "agent", a.id);
+      return (sendJson(res, 200, {
+        type: "agent",
+        name: a.name,
+        displayName: profileTextAllowed ? a.displayName : a.name,
+        description: profileTextAllowed ? a.description : null,
+        runtime: a.runtime,
+        model: a.model,
+        status: a.status,
+      }), true);
+    }
+    const uRow = who ? (await db.select().from(schema.users).where(eq(schema.users.name, who)))[0] : null;
+    const u = uRow && (await db.select({ userId: schema.serverMembers.userId }).from(schema.serverMembers).where(and(
+      eq(schema.serverMembers.serverId, serverId),
+      eq(schema.serverMembers.userId, uRow.id),
+    )))[0] ? uRow : null;
     if (u) return (sendJson(res, 200, { type: "user", name: u.name, displayName: u.displayName, description: u.description }), true);
     return (sendErr(res, 404, "profile not found"), true);
   }
@@ -727,11 +842,9 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
   if (p === "/agent-api/message/resolve" && method === "GET") {
     const raw = (url.searchParams.get("id") || "").trim();
     if (!raw) return (sendErr(res, 400, "id required"), true);
-    const m = (await db.select().from(schema.messages).where(and(eq(schema.messages.serverId, serverId), raw.length >= 32 ? eq(schema.messages.id, raw) : like(sql`${schema.messages.id}::text`, raw.toLowerCase() + "%"))))[0];
+    const messageId = await resolveMessageId(serverId, raw, agent.id);
+    const m = messageId ? (await db.select().from(schema.messages).where(eq(schema.messages.id, messageId)))[0] : undefined;
     if (!m) return (sendErr(res, 404, "message not found", { code: "RESOLVE_FAILED" }), true);
-    // Agent ACL: resolve has its own message lookup (not resolveMessageId), so gate the resolved message's
-    // channel here too — otherwise it leaks any message's content by (short) id (C7).
-    if (!(await canAgentReadChannel(serverId, m.channelId, agent.id))) return (sendErr(res, 404, "message not found", { code: "RESOLVE_FAILED" }), true);
     const ch = (await db.select().from(schema.channels).where(eq(schema.channels.id, m.channelId)))[0];
     return (sendJson(res, 200, { ...serialize(m), text: fmt(m, ch ? await addressableTarget(ch, agent.id) : m.channelId) }), true);
   }
@@ -740,7 +853,11 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     const tgt = await resolveTarget(serverId, url.searchParams.get("channel") ?? "", agent.id);
     if (!tgt) return (sendErr(res, 404, "channel not found"), true);
     const mems = await channelMembers(tgt.channelId);
-    return (sendJson(res, 200, { members: mems.map((m) => ({ type: m.type, name: m.name, displayName: m.displayName })) }), true);
+    return (sendJson(res, 200, { members: mems.map((m) => ({
+      type: m.type,
+      name: m.name,
+      displayName: m.type === "agent" && !inputSenderAllowed(agent, "agent", m.id) ? m.name : m.displayName,
+    })) }), true);
   }
   // channel leave (only affects own membership)
   if (p === "/agent-api/channel/leave" && method === "POST") {
@@ -778,7 +895,11 @@ export async function handleAgentApi(req: IncomingMessage, res: ServerResponse, 
     if (!a) return (sendErr(res, 404, "attachment not found"), true);
     // Agent ACL: the agent may view an attachment only if it uploaded it, or it can access the channel the
     // attachment was posted in — otherwise an attachment id leaks a private channel's file. 404 (don't reveal).
-    const canView = (a.uploaderType === "agent" && a.uploaderId === agent.id) || (!!a.channelId && await canAgentReadChannel(serverId, a.channelId, agent.id));
+    const ownUpload = a.uploaderType === "agent" && a.uploaderId === agent.id;
+    const uploaderAllowed = inputSenderAllowed(agent, a.uploaderType ?? "system", a.uploaderId);
+    const channelAllowed = !!a.channelId && await canAgentReadChannel(serverId, a.channelId, agent.id);
+    const parentVisible = !a.messageId || !!await resolveMessageId(serverId, a.messageId, agent.id);
+    const canView = ownUpload || (uploaderAllowed && channelAllowed && parentVisible);
     if (!canView) return (sendErr(res, 404, "attachment not found"), true);
     try {
       const buf = await readObject(a.storageKey);
